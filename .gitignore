@@ -1,0 +1,12 @@
+node_modules/
+.opencode/workflows/runs/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/.gitignore
+dist/
+*.log
+
+# IDE / OS
+.idea/
+.DS_Store
+*.local

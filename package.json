@@ -1,0 +1,25 @@
+{
+  "name": "opencode-workflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Workflow orchestration for opencode: model-authored scripts, parallel sub-agent fleet, live TUI progress view",
+  "engines": {
+    "opencode": ">=1.3.4"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:runtime": "node src/runtime/selftest.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.15.13",
+    "@opentui/keymap": "^0.5.11",
+    "@opentui/solid": "^0.5.11",
+    "solid-js": "^1.9.0",
+    "zod": "^4.1.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
