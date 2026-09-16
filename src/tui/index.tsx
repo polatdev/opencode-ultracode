@@ -7,7 +7,7 @@
 //   workflow-agent   — agent detail (live feed / prompt / activity / outcome)
 //   workflow-result  — full-screen scrollable run result
 //
-// State comes from .opencode/workflows/runs/<id>/state.json, polled by the
+// State comes from /tmp/opencode-workflows/<project>/<id>/state.json, polled by the
 // store and merged fine-grained so only changed cells redraw.
 
 import type { TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"

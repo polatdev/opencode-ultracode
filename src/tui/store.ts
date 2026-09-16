@@ -1,4 +1,4 @@
-// TUI store: polls .opencode/workflows/runs/<id>/state.json and exposes the
+// TUI store: polls /tmp/opencode-workflows/<project>/<id>/state.json and exposes the
 // run list as a fine-grained Solid store. Changed files are merged with
 // `reconcile`, so only the cells whose values actually changed re-render —
 // rows are never torn down and rebuilt on a tick, which keeps the view calm.
@@ -8,7 +8,7 @@ import { join } from "node:path"
 import { batch, createMemo, createSignal } from "solid-js"
 import { createStore as createSolidStore, reconcile } from "solid-js/store"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { controlPath, workflowRoot, type RunState } from "../shared/state.ts"
+import { controlPath, runsRoot, workflowRoot, type RunState } from "../shared/state.ts"
 
 export interface WorkflowStore {
   /** all runs, newest first (fine-grained proxies — read fields inside JSX) */
@@ -58,8 +58,7 @@ export const STALE_AFTER_MS = 20_000
 
 export function createStore(api: TuiPluginApi, onDispose?: (fn: () => void) => void): WorkflowStore {
   const root = () => api.state.path.worktree || api.state.path.directory
-  const wfRoot = () => workflowRoot(root())
-  const runsDir = () => join(wfRoot(), "runs")
+  const runsDir = () => runsRoot(root())
   const dispose = onDispose ?? (() => {})
 
   const [state, setState] = createSolidStore<{ runs: Record<string, RunState> }>({ runs: {} })
@@ -221,7 +220,7 @@ export function createStore(api: TuiPluginApi, onDispose?: (fn: () => void) => v
     control: (runId, action) => {
       try {
         mkdirSync(join(runsDir(), runId), { recursive: true })
-        writeFileSync(controlPath(wfRoot(), runId), JSON.stringify({ action, at: Date.now() }))
+        writeFileSync(controlPath(runsDir(), runId), JSON.stringify({ action, at: Date.now() }))
       } catch {}
     },
     deleteRun: (runId) => {
@@ -234,7 +233,7 @@ export function createStore(api: TuiPluginApi, onDispose?: (fn: () => void) => v
       try {
         const src = join(runsDir(), run.runId, "script.js")
         if (!existsSync(src)) return undefined
-        const destDir = join(root(), ".opencode", "workflows")
+        const destDir = workflowRoot(root())
         mkdirSync(destDir, { recursive: true })
         const dest = join(destDir, `${safe(run.name)}.js`)
         writeFileSync(dest, readFileSync(src, "utf8"))

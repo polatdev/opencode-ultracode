@@ -7,10 +7,11 @@
 
 import { tool, type Hooks, type PluginInput } from "@opencode-ai/plugin"
 import { join } from "node:path"
-import { existsSync, readFileSync } from "node:fs"
+import { fileURLToPath } from "node:url"
+import { existsSync, readFileSync, statSync } from "node:fs"
 import { generateRunId, RunEngine } from "../runtime/engine.ts"
 import { parseScript } from "../runtime/script.ts"
-import { type AgentState, type RunState } from "../shared/state.ts"
+import { type AgentState, type RunState, runsRoot } from "../shared/state.ts"
 
 const KEYWORD_RE =
   /\b(ultracode|run\s+a\s+workflow|start\s+(?:a\s+)?workflow|use\s+(?:a\s+)?workflow)\b/iu
@@ -25,13 +26,19 @@ Use it when:
 - the task is too large for one pass: it spans many files/modules, decomposes into parallel workstreams (audit, review, migration, research), or benefits from independent adversarial verification.
 When the task seems large but the user did not ask: recommend a workflow in one or two sentences (scale + rough shape: phases and agent count) and wait for the go-ahead before calling the tool.
 Do NOT use workflows for trivial or single-file tasks.
-For script format (meta block, primitives, patterns), load the \`workflow-authoring\` skill if available.`
+For script format (meta block, primitives, patterns), load the \`workflow-authoring\` skill (bundled with this plugin) before writing a script.`
 
 const TOOL_DESCRIPTION = `Run a multi-agent workflow: parallel sub-agents over phases with structured outputs, for tasks too large for one pass.
 Args: one of \`script\` (inline JS workflow, must start with \`export const meta = { name, description, phases? }\`), \`scriptPath\` (file), or \`name\` (saved workflow in .opencode/workflows/). Optional \`args\` passed to the script.
 The run starts in the background after the user approves the plan; a result turn is delivered when it finishes. The user can watch progress in /workflows (phases, per-agent model/tokens/time, stop/pause).
 Use for: audits, multi-file migrations, code review across many files, research sweeps, anything parallelizable or needing independent verification.
-Authoring guide: the workflow-authoring skill (load it first if available) documents agent()/parallel()/pipeline()/phase()/log(), schema-validated structured output, and quality patterns.`
+Authoring guide: the workflow-authoring skill (bundled with this plugin; load it first) documents agent()/parallel()/pipeline()/phase()/log(), schema-validated structured output, and quality patterns.`
+
+// Skills shipped with the plugin (skills/<name>/SKILL.md next to src/). Registered
+// through the `config` hook via `skills.paths`, so the model gets the
+// workflow-authoring skill in every project without the user copying files
+// into .opencode/skill or ~/.config/opencode/skill.
+const BUNDLED_SKILLS_DIR = fileURLToPath(new URL("../../skills", import.meta.url))
 
 type Client = NonNullable<PluginInput["client"]>
 
@@ -74,8 +81,10 @@ export default async (input: PluginInput): Promise<Hooks> => {
     return modelsPromise
   }
 
+  const projectRootOf = (worktree: string, directory: string): string =>
+    existsSync(worktree) ? worktree : directory
   const opencodeDirOf = (worktree: string, directory: string): string =>
-    existsSync(worktree) ? join(worktree, ".opencode") : join(directory, ".opencode")
+    join(projectRootOf(worktree, directory), ".opencode")
 
   const preview = (args: { script?: string; scriptPath?: string; name?: string }): {
     name: string
@@ -145,6 +154,7 @@ export default async (input: PluginInput): Promise<Hooks> => {
         {
           client: input.client as any,
           opencodeDir: opencodeDirOf(input.worktree, ctx.directory),
+          runsRoot: runsRoot(projectRootOf(input.worktree, ctx.directory)),
           mainSessionID: ctx.sessionID,
           defaultModel: sessionModel.get(ctx.sessionID),
           availableModels,
@@ -194,6 +204,25 @@ export default async (input: PluginInput): Promise<Hooks> => {
 
   return {
     tool: { workflow: workflowTool },
+
+    // Runs once at startup with the merged config object that opencode later
+    // hands to skill discovery, so pushing here is enough to make the bundled
+    // skills visible in this and every other project the plugin is loaded in.
+    config: async (cfg) => {
+      let isDir = false
+      try {
+        isDir = statSync(BUNDLED_SKILLS_DIR).isDirectory()
+      } catch {}
+      if (!isDir) {
+        log("warn", "bundled skills directory missing; workflow-authoring skill unavailable", { dir: BUNDLED_SKILLS_DIR })
+        return
+      }
+      const c = cfg as { skills?: { paths?: string[]; urls?: string[] } }
+      c.skills ??= {}
+      c.skills.paths ??= []
+      if (!c.skills.paths.includes(BUNDLED_SKILLS_DIR)) c.skills.paths.push(BUNDLED_SKILLS_DIR)
+      log("debug", "registered bundled skills", { dir: BUNDLED_SKILLS_DIR })
+    },
 
     "chat.params": async (i) => {
       const label = modelLabel(i.model?.providerID, i.model?.id)

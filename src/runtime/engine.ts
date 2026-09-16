@@ -1,6 +1,6 @@
 // Workflow engine: runs a parsed workflow script against the opencode SDK.
 // Deterministic-ish sandbox (see script.ts), concurrency pool, live state
-// writing to .opencode/workflows/runs/<runId>/state.json, pause/stop control.
+// writing to /tmp/opencode-workflows/<project>/<runId>/state.json, pause/stop control.
 
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync, existsSync, rmSync } from "node:fs"
 import { cpus } from "node:os"
@@ -28,8 +28,10 @@ export interface EngineClient {
 
 export interface EngineDeps {
   client: EngineClient
-  /** absolute path to the .opencode dir (runs live in <dir>/workflows/runs) */
+  /** absolute path to the project's .opencode dir (saved workflows live in <dir>/workflows) */
   opencodeDir: string
+  /** absolute directory that holds one folder per run (see runsRoot() in shared/state.ts) */
+  runsRoot: string
   mainSessionID: string
   defaultModel?: string
   availableModels: Set<string>
@@ -95,7 +97,7 @@ export class RunEngine {
   }
 
   get runDir() {
-    return runDir(join(this.deps.opencodeDir, "workflows"), this.runId)
+    return runDir(this.deps.runsRoot, this.runId)
   }
 
   registerSession(agentId: string, sessionId: string) {
@@ -550,7 +552,7 @@ export class RunEngine {
   // --- control (pause / stop) -------------------------------------------------
 
   private pollControl(): void {
-    const p = controlPath(join(this.deps.opencodeDir, "workflows"), this.runId)
+    const p = controlPath(this.deps.runsRoot, this.runId)
     let raw: string | undefined
     try {
       raw = readFileSync(p, "utf8")
@@ -662,7 +664,7 @@ export class RunEngine {
     if (!this.state) return
     try {
       mkdirSync(this.runDir, { recursive: true })
-      writeFileSync(statePath(join(this.deps.opencodeDir, "workflows"), this.runId), JSON.stringify(this.state, null, 2))
+      writeFileSync(statePath(this.deps.runsRoot, this.runId), JSON.stringify(this.state, null, 2))
     } catch (e: any) {
       this.deps.log?.("error", `workflow state write failed: ${errText(e)}`)
     }
@@ -671,7 +673,7 @@ export class RunEngine {
   private writeJournal(entry: any): void {
     try {
       mkdirSync(this.runDir, { recursive: true })
-      appendFileSync(journalPath(join(this.deps.opencodeDir, "workflows"), this.runId), JSON.stringify(entry) + "\n")
+      appendFileSync(journalPath(this.deps.runsRoot, this.runId), JSON.stringify(entry) + "\n")
     } catch {}
   }
 

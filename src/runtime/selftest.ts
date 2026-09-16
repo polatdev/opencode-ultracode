@@ -10,6 +10,7 @@ import { parseScript } from "./script.ts"
 
 const tmp = mkdtempSync(join(tmpdir(), "wf-selftest-"))
 const opencodeDir = join(tmp, ".opencode")
+const runsRoot = join(tmp, "runs")
 
 let sessionSeq = 0
 const seenSessions: string[] = []
@@ -133,7 +134,7 @@ async function main() {
   console.log("test 2: full demo-fanout run (4 agents)")
   const runId = generateRunId()
   const engine = new RunEngine(
-    { client: fakeClient as any, opencodeDir, mainSessionID: "ses_main", defaultModel: "mock/sonnet", availableModels: new Set(["mock/sonnet", "mock/haiku"]), runArgs: { extra: 1 } },
+    { client: fakeClient as any, opencodeDir, runsRoot, mainSessionID: "ses_main", defaultModel: "mock/sonnet", availableModels: new Set(["mock/sonnet", "mock/haiku"]), runArgs: { extra: 1 } },
     runId,
   )
   const t0 = Date.now()
@@ -147,7 +148,7 @@ async function main() {
   assert.ok(result.final?.report?.best?.length <= 3, "expected synthesized report")
 
   // state file
-  const state = JSON.parse(readFileSync(join(opencodeDir, "workflows", "runs", runId, "state.json"), "utf8"))
+  const state = JSON.parse(readFileSync(join(runsRoot, runId, "state.json"), "utf8"))
   assert.equal(state.status, "completed")
   assert.equal(state.agentCount, 4)
   assert.equal(state.agentDone, 4)
@@ -165,7 +166,7 @@ async function main() {
   console.log(`  ok: state.json (4 agents, 2 phases, tokens=${state.totalTokens})`)
 
   // journal
-  const journal = readFileSync(join(opencodeDir, "workflows", "runs", runId, "journal.jsonl"), "utf8").trim().split("\n")
+  const journal = readFileSync(join(runsRoot, runId, "journal.jsonl"), "utf8").trim().split("\n")
   assert.ok(journal.length >= 9, `journal lines = ${journal.length}`)
   const kinds = journal.map((l) => JSON.parse(l).type)
   assert.ok(kinds.includes("run-start") && kinds.includes("run-end"))
@@ -174,7 +175,7 @@ async function main() {
   console.log("  ok: journal (run-start, 4x agent-start/done, run-end)")
 
   // script.js persisted
-  assert.ok(existsSync(join(opencodeDir, "workflows", "runs", runId, "script.js")), "script.js persisted")
+  assert.ok(existsSync(join(runsRoot, runId, "script.js")), "script.js persisted")
   console.log("  ok: script.js persisted")
 
   // ---- test 3: deterministic sandbox ---------------------------------------
@@ -190,10 +191,10 @@ await agent("say hi", { label: "t3a" })
 return "done"
 `
   const rid3 = generateRunId()
-  const e3 = new RunEngine({ client: fakeClient as any, opencodeDir, mainSessionID: "ses_main", availableModels: new Set() }, rid3)
+  const e3 = new RunEngine({ client: fakeClient as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set() }, rid3)
   const r3 = await e3.run({ script: S1 })
   assert.equal(r3.status, "completed")
-  const s3 = JSON.parse(readFileSync(join(opencodeDir, "workflows", "runs", rid3, "state.json"), "utf8"))
+  const s3 = JSON.parse(readFileSync(join(runsRoot, rid3, "state.json"), "utf8"))
   const logs = s3.logs.map((l: any) => l.message).join(" | ")
   console.log(`  logs: ${logs}`)
   assert.ok(logs.includes("date-now-blocked:true"))
@@ -210,10 +211,10 @@ log("date-ok:" + (new Date(1700000000000).getTime() === 1700000000000))
 return 42
 `
   const rid3b = generateRunId()
-  const e3b = new RunEngine({ client: fakeClient as any, opencodeDir, mainSessionID: "ses_main", availableModels: new Set() }, rid3b)
+  const e3b = new RunEngine({ client: fakeClient as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set() }, rid3b)
   const r3b = await e3b.run({ script: S2 })
   assert.equal(r3b.status, "completed")
-  const s3b = JSON.parse(readFileSync(join(opencodeDir, "workflows", "runs", rid3b, "state.json"), "utf8"))
+  const s3b = JSON.parse(readFileSync(join(runsRoot, rid3b, "state.json"), "utf8"))
   assert.ok(s3b.logs.some((l: any) => l.message === "date-ok:true"))
   assert.equal(r3b.result, "42")
   console.log("  ok: new Date(ts) + return values work")
@@ -234,10 +235,10 @@ log("parallel-nulls:" + bad.filter(Boolean).length + "/" + bad.length)
 return out
 `
   const rid4 = generateRunId()
-  const e4 = new RunEngine({ client: fakeClient as any, opencodeDir, mainSessionID: "ses_main", availableModels: new Set() }, rid4)
+  const e4 = new RunEngine({ client: fakeClient as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set() }, rid4)
   const r4 = await e4.run({ script: S4 })
   assert.equal(r4.status, "completed")
-  const s4 = JSON.parse(readFileSync(join(opencodeDir, "workflows", "runs", rid4, "state.json"), "utf8"))
+  const s4 = JSON.parse(readFileSync(join(runsRoot, rid4, "state.json"), "utf8"))
   const l4 = s4.logs.map((l: any) => l.message).join(" | ")
   console.log(`  logs: ${l4}`)
   const pm = l4.match(/pipeline:(.*) \| parallel-nulls/)

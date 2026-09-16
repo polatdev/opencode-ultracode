@@ -1,6 +1,10 @@
 // Shared types between the server plugin (engine) and the TUI plugin (views).
 // The state file written by the server is the single source of truth the TUI polls.
 
+import { createHash } from "node:crypto"
+import { tmpdir } from "node:os"
+import { basename } from "node:path"
+
 export type RunStatus =
   | "pending"
   | "running"
@@ -119,18 +123,32 @@ export interface ControlState {
 
 // --- wire helpers -----------------------------------------------------------
 
-export function runDir(workflowDir: string, runId: string): string {
-  return `${workflowDir}/runs/${runId}`
+/**
+ * Where run artifacts (state.json, journal.jsonl, script.js, control.json) live:
+ * /tmp/opencode-workflows/<project-name>-<hash6>. Runs are scratch data, so they
+ * stay out of the project tree; the hash suffix keeps two projects with the same
+ * folder name (e.g. two "api" checkouts) from sharing a run list.
+ * Saved workflows (<name>.js) are project assets and stay under workflowRoot().
+ */
+export function runsRoot(worktree: string): string {
+  const base = process.platform === "win32" ? tmpdir() : "/tmp"
+  const name = (basename(worktree) || "project").replace(/[^a-zA-Z0-9._-]/g, "-")
+  const hash = createHash("sha1").update(worktree).digest("hex").slice(0, 6)
+  return `${base}/opencode-workflows/${name}-${hash}`
 }
-export function statePath(workflowDir: string, runId: string): string {
-  return `${runDir(workflowDir, runId)}/state.json`
+export function runDir(runsRootDir: string, runId: string): string {
+  return `${runsRootDir}/${runId}`
 }
-export function controlPath(workflowDir: string, runId: string): string {
-  return `${runDir(workflowDir, runId)}/control.json`
+export function statePath(runsRootDir: string, runId: string): string {
+  return `${runDir(runsRootDir, runId)}/state.json`
 }
-export function journalPath(workflowDir: string, runId: string): string {
-  return `${runDir(workflowDir, runId)}/journal.jsonl`
+export function controlPath(runsRootDir: string, runId: string): string {
+  return `${runDir(runsRootDir, runId)}/control.json`
 }
+export function journalPath(runsRootDir: string, runId: string): string {
+  return `${runDir(runsRootDir, runId)}/journal.jsonl`
+}
+/** saved (named) workflow scripts: <worktree>/.opencode/workflows/<name>.js */
 export function workflowRoot(worktree: string): string {
   return `${worktree}/.opencode/workflows`
 }
