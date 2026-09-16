@@ -32,6 +32,8 @@ export interface PhaseState extends PhaseDef {
 }
 
 export interface AgentActivity {
+  /** host tool-call id (when the host sends one) — used to match updates */
+  callId?: string
   /** tool name, e.g. "StructuredOutput" or "bash" */
   tool: string
   /** short title / first words of the call */
@@ -64,6 +66,8 @@ export interface AgentState {
   outcomeText?: string
   /** latest LLM text chunk seen while the agent is running (live view) */
   liveText?: string
+  /** recent live activity (text chunks + tool calls), newest last, capped */
+  liveFeed?: { at: number; kind: "text" | "tool"; text: string }[]
   startedAt?: number
   endedAt?: number
   error?: string

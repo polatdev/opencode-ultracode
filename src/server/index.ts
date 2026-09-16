@@ -1,7 +1,7 @@
 // opencode-workflow — server plugin.
 //
 // Registers the `workflow` tool (model-facing orchestration), keyword triggers
-// ("workflow başlat", "ultracode", ...), a system-prompt nudge so the model
+// ("run a workflow", "ultracode", ...), a system-prompt nudge so the model
 // recommends workflows for large tasks, and live usage tracking for sub-agent
 // child sessions.
 
@@ -13,7 +13,7 @@ import { parseScript } from "../runtime/script.ts"
 import { type AgentState, type RunState } from "../shared/state.ts"
 
 const KEYWORD_RE =
-  /\b(workflow\s+başlat|workflow\s+başla|workflow\s+kullan|başlat\s+workflow|workflow\s+aç|ultracode|run\s+a\s+workflow|start\s+(?:a\s+)?workflow|use\s+(?:a\s+)?workflow|kullan\s+workflow)\b/iu
+  /\b(ultracode|run\s+a\s+workflow|start\s+(?:a\s+)?workflow|use\s+(?:a\s+)?workflow)\b/iu
 
 const KEYWORD_DIRECTIVE =
   "[workflow requested] The user explicitly asked for workflow orchestration. Immediately call the `workflow` tool: author a script (must start with `export const meta = {...}`) that decomposes the request into phases and parallel agents, using agent()/parallel()/pipeline()/phase()/log(). Keep the plan proportional to the task."
@@ -21,7 +21,7 @@ const KEYWORD_DIRECTIVE =
 const SYSTEM_GUIDANCE = `## Workflow orchestration
 You have a \`workflow\` tool that fans a task out across many parallel sub-agents (50-100 in large runs) with phases, structured outputs, and a live progress view (/workflows).
 Use it when:
-- the user explicitly asks ("workflow başlat", "run a workflow", "ultracode"), or
+- the user explicitly asks ("run a workflow", "ultracode", or the same in another language — the model decides), or
 - the task is too large for one pass: it spans many files/modules, decomposes into parallel workstreams (audit, review, migration, research), or benefits from independent adversarial verification.
 When the task seems large but the user did not ask: recommend a workflow in one or two sentences (scale + rough shape: phases and agent count) and wait for the go-ahead before calling the tool.
 Do NOT use workflows for trivial or single-file tasks.
@@ -232,8 +232,14 @@ export default async (input: PluginInput): Promise<Hooks> => {
     },
 
     dispose: async () => {
+      // opencode is going away: close out live runs so their state files do
+      // not claim "running" forever (the TUI would otherwise refuse to delete them)
       for (const engine of active.values()) {
-        // best effort: engines keep their timers; nothing else to do here
+        try {
+          engine.shutdown("opencode exited while the workflow was running")
+        } catch (e) {
+          log("warn", `workflow shutdown failed: ${errMsg(e)}`)
+        }
       }
       active.clear()
     },

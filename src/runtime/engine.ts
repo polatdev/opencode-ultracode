@@ -76,6 +76,7 @@ export class RunEngine {
   private agentSeq = 0
   private sessionToAgent = new Map<string, string>()
   private sessionMsgTotals = new Map<string, Map<string, { t: number; o: number; c: number }>>()
+  private lastTextPart = new Map<string, string>()
   private sem = 0
   private semMax: number
   private waiters: Array<() => void> = []
@@ -148,30 +149,59 @@ export class RunEngine {
       const txt = typeof part?.text === "string" ? part.text : ""
       if (!txt.trim()) return
       a.liveText = txt.slice(-800)
+      const pid = typeof part?.id === "string" ? part.id : ""
+      if (pid !== this.lastTextPart.get(agentId)) {
+        this.lastTextPart.set(agentId, pid)
+        this.pushLiveFeed(a, "text", txt)
+      } else {
+        // same part still streaming: refresh the newest feed line in place
+        const f = a.liveFeed?.[a.liveFeed.length - 1]
+        if (f && f.kind === "text") f.text = txt.trim().replace(/\s+/g, " ").slice(0, 160)
+      }
       this.markDirty()
       return
     }
     if (part?.type !== "tool") return
     const st = part.state
-    // a new tool part (or its status flip) counts as one tool call
-    const existing = a.activity.find((x) => x.tool === part.tool && !x.endedAt)
+    const callId = typeof part?.callID === "string" ? part.callID : typeof part?.id === "string" ? part.id : undefined
+    // match the open activity entry by call id first; fall back to "latest
+    // open entry of the same tool" for hosts that do not send ids
+    const existing =
+      (callId && a.activity.find((x) => x.callId === callId)) ||
+      a.activity.find((x) => !x.callId && x.tool === part.tool && !x.endedAt)
+    const title = toolTitle(part.tool, st)
     if (!existing) {
       a.activity.push({
+        callId,
         tool: part.tool,
-        title: st?.title ?? st?.output?.slice?.(0, 80) ?? String(part.tool),
+        title,
         preview: undefined,
         startedAt: Date.now(),
       })
       a.toolCalls = a.activity.length
+      this.pushLiveFeed(a, "tool", `${part.tool} ${title !== part.tool ? title : ""}`)
       this.recount()
       this.markDirty()
       return
     }
-    if (st?.status === "completed" || st?.status === "error") {
+    if (existing.title === existing.tool && title !== part.tool) existing.title = title
+    if (!existing.endedAt && (st?.status === "completed" || st?.status === "error")) {
       existing.endedAt = Date.now()
       existing.preview = truncate(String(st?.output ?? st?.error ?? ""), 300)
+      const tail = st?.status === "error" ? `failed · ${oneLine(String(st?.error ?? ""))}` : "done"
+      this.pushLiveFeed(a, "tool", `${existing.tool} ${tail} · ${existing.title !== existing.tool ? existing.title : ""}`)
+      this.markDirty()
+    } else {
       this.markDirty()
     }
+  }
+
+  private pushLiveFeed(a: AgentState, kind: "text" | "tool", text: string): void {
+    const line = String(text ?? "").trim().replace(/\s+/g, " ").slice(0, 160)
+    if (!line) return
+    const feed = a.liveFeed ?? (a.liveFeed = [])
+    feed.push({ at: Date.now(), kind, text: line })
+    while (feed.length > 10) feed.shift()
   }
 
   // --- run lifecycle -------------------------------------------------------
@@ -677,6 +707,29 @@ export class RunEngine {
     return undefined
   }
 
+  /** host is shutting down: mark the run stopped so the TUI never shows a zombie "running" */
+  shutdown(reason: string): void {
+    if (!this.state) return
+    if (this.state.status === "completed" || this.state.status === "failed" || this.state.status === "stopped") return
+    this.stopRequested = true
+    this.abortAll()
+    for (const a of Object.values(this.state.agents)) {
+      if (a.status === "running" || a.status === "queued") {
+        a.status = "cancelled"
+        a.error = reason
+        a.endedAt = Date.now()
+      }
+    }
+    this.recount()
+    this.state.status = "stopped"
+    this.state.endedAt = Date.now()
+    this.state.error = this.state.error ?? reason
+    this.logLine("stopped", reason)
+    this.writeJournal({ type: "run-end", runId: this.runId, status: "stopped", at: Date.now(), reason })
+    this.cleanupTimers()
+    this.flushNow()
+  }
+
   private cleanupTimers(): void {
     if (this.heartbeat) clearInterval(this.heartbeat)
     if (this.controlTimer) clearInterval(this.controlTimer)
@@ -740,3 +793,22 @@ function safeName(n: string): string {
 }
 
 export type { Primitives }
+
+/** human title for a tool call: host title → recognisable input field → tool name */
+function toolTitle(tool: string, st: any): string {
+  const t = typeof st?.title === "string" ? st.title.trim() : ""
+  if (t) return oneLine(t).slice(0, 120)
+  const input = st?.input
+  if (input && typeof input === "object") {
+    for (const k of ["command", "filePath", "path", "pattern", "query", "url", "description", "prompt", "title"]) {
+      const v = (input as any)[k]
+      if (typeof v === "string" && v.trim()) return oneLine(v).slice(0, 120)
+    }
+    for (const v of Object.values(input)) if (typeof v === "string" && v.trim()) return oneLine(v).slice(0, 120)
+  }
+  return String(tool)
+}
+
+function oneLine(s: string): string {
+  return s.replace(/\s+/g, " ").trim()
+}
