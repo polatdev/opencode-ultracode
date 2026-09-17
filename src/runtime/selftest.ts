@@ -161,9 +161,17 @@ async function main() {
   const synth = state.agents[state.agentOrder[3]]
   assert.equal(synth.model, "mock/sonnet", "agent should inherit session model")
   assert.ok(synth.tokens > 0, "tokens tracked")
+  // mock message: input 10k + cache read 20k + cache write 500 = 30.5k context per call
+  assert.equal(synth.contextTokens, 30_500, "context = prompt size of the latest call")
+  assert.ok(synth.tokens >= synth.contextTokens + 3_600, "billed includes output on top of context")
   assert.ok(synth.outcome, "outcome stored")
   assert.ok(state.totalTokens > 0)
-  console.log(`  ok: state.json (4 agents, 2 phases, tokens=${state.totalTokens})`)
+  assert.equal(
+    state.totalContextTokens,
+    state.agentOrder.reduce((n: number, id: string) => n + state.agents[id].contextTokens, 0),
+    "run context = sum of agent contexts",
+  )
+  console.log(`  ok: state.json (4 agents, 2 phases, billed=${state.totalTokens}, context=${state.totalContextTokens})`)
 
   // journal
   const journal = readFileSync(join(runsRoot, runId, "journal.jsonl"), "utf8").trim().split("\n")

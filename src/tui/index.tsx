@@ -10,8 +10,8 @@
 // State comes from /tmp/opencode-workflows/<project>/<id>/state.json, polled by the
 // store and merged fine-grained so only changed cells redraw.
 
-import type { TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import type { ScrollBoxRenderable } from "@opentui/core"
+import type { TuiPluginApi, TuiPluginModule, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
+import type { RGBA, ScrollBoxRenderable } from "@opentui/core"
 import { createEffect, createMemo, For, on, onCleanup, Show } from "solid-js"
 import { createSignal } from "solid-js"
 import {
@@ -404,7 +404,7 @@ export const plugin: TuiPluginModule = {
         try {
           api.attention.notify({
             title: `Workflow ${r.status}`,
-            message: `${r.name} — ${r.agentDone}/${r.agentCount} agents, ${fmtTokens(r.totalTokens)}, ${fmtCost(r.totalCost)}`,
+            message: `${r.name} — ${r.agentDone}/${r.agentCount} agents, ${fmtCtx(r.totalContextTokens)} context, ${fmtTokens(r.totalTokens)} billed, ${fmtCost(r.totalCost)}`,
             sound: { name: r.status === "failed" ? "error" : "done" },
           })
         } catch {}
@@ -422,8 +422,37 @@ interface ScreenProps {
   store: WorkflowStore
 }
 
+/**
+ * One step dimmer than textMuted: blend it ~45% toward the background. Used for
+ * secondary numbers (billed tokens) that should be readable but not compete
+ * with the headline value. Falls back to textMuted for non-RGB theme colors.
+ */
+function faintColor(c: TuiThemeCurrent): string | RGBA {
+  const m = c.textMuted
+  const bg = c.background
+  try {
+    if (!m || !bg || m.intent !== "rgb" || bg.intent !== "rgb") return m
+    const [mr, mg, mb] = m.toInts()
+    const [br, bgr, bb] = bg.toInts()
+    const mix = (a: number, b: number) => Math.round(a * 0.55 + b * 0.45)
+    const hex = (v: number) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, "0")
+    return `#${hex(mix(mr, br))}${hex(mix(mg, bgr))}${hex(mix(mb, bb))}`
+  } catch {
+    return m
+  }
+}
+
+/** context size for headline use; "—" for state files written before it was tracked */
+function fmtCtx(n: number | undefined): string {
+  return n == null ? "— ctx" : fmtTokens(n)
+}
+function fmtCtxCell(n: number | undefined): string {
+  return n == null ? "—" : fmtTok(n)
+}
+
 function useTheme(api: TuiPluginApi) {
   const t = () => api.theme.current
+  const faint = () => faintColor(api.theme.current)
   const tone = (which: Tone) => {
     const c = t()
     switch (which) {
@@ -445,7 +474,7 @@ function useTheme(api: TuiPluginApi) {
         return c.textMuted
     }
   }
-  return { t, tone }
+  return { t, tone, faint }
 }
 
 function statusTone(status: string | undefined): Tone {
@@ -604,12 +633,13 @@ function modelsOf(run: RunState): string {
 
 function ListScreen(props: ScreenProps & { sel: () => number }) {
   const { api, store } = props
-  const { t, tone } = useTheme(api)
+  const { t, tone, faint } = useTheme(api)
   const runs = store.runs
   const live = () => runs().filter((r) => isLive(r.status) && !store.isStale(r)).length
-  const wide = () => store.size().width >= 116
-  const W = { icon: 2, status: 11, bar: 10, count: 8, tok: 8, cost: 9, time: 9, ago: 11 }
-  const fixed = () => W.icon + W.status + W.bar + W.count + W.tok + W.time + (wide() ? W.cost + W.ago : 0) + 4
+  const wide = () => store.size().width >= 124
+  // CONTEXT = live prompt size (headline); BILLED = cumulative tokens sent, faint
+  const W = { icon: 2, status: 11, bar: 10, count: 8, tok: 9, billed: 9, cost: 9, time: 9, ago: 11 }
+  const fixed = () => W.icon + W.status + W.bar + W.count + W.tok + W.time + (wide() ? W.billed + W.cost + W.ago : 0) + 4
   const nameW = () => Math.max(14, store.size().width - fixed() - 4)
   let sb: ScrollBoxRenderable | undefined
   createEffect(on(props.sel, (i) => keepInView(sb, i)))
@@ -642,8 +672,9 @@ function ListScreen(props: ScreenProps & { sel: () => number }) {
           <text style={{ fg: t().textMuted, width: nameW() }}>NAME</text>
           <text style={{ fg: t().textMuted, width: W.status }}>STATUS</text>
           <text style={{ fg: t().textMuted, width: W.bar + W.count }}>AGENTS</text>
-          <text style={{ fg: t().textMuted, width: W.tok }}>{cellR("TOKENS", W.tok)}</text>
+          <text style={{ fg: t().textMuted, width: W.tok }}>{cellR("CONTEXT", W.tok)}</text>
           <Show when={wide()}>
+            <text style={{ fg: faint(), width: W.billed }}>{cellR("BILLED", W.billed)}</text>
             <text style={{ fg: t().textMuted, width: W.cost }}>{cellR("COST", W.cost)}</text>
           </Show>
           <text style={{ fg: t().textMuted, width: W.time }}>{cellR("TIME", W.time)}</text>
@@ -678,8 +709,9 @@ function ListScreen(props: ScreenProps & { sel: () => number }) {
                   <text style={{ fg: tone(statusTone(shownStatus(store, run))), width: W.status }}>{cell(statusLabel(shownStatus(store, run)), W.status)}</text>
                   <Bar api={api} done={() => run.agentDone} total={() => run.agentCount} width={W.bar - 1} tone={() => (run.status === "failed" ? "error" : run.status === "completed" ? "success" : "accent")} />
                   <text style={{ fg: dim(), width: W.count + 1 }}>{` ${run.agentDone}/${run.agentCount}`}</text>
-                  <text style={{ fg: dim(), width: W.tok }}>{cellR(fmtTok(run.totalTokens), W.tok)}</text>
+                  <text style={{ fg: dim(), width: W.tok }}>{cellR(fmtCtxCell(run.totalContextTokens), W.tok)}</text>
                   <Show when={wide()}>
+                    <text style={{ fg: faint(), width: W.billed }}>{cellR(fmtTok(run.totalTokens), W.billed)}</text>
                     <text style={{ fg: dim(), width: W.cost }}>{cellR(fmtCost(run.totalCost), W.cost)}</text>
                   </Show>
                   <text style={{ fg: dim(), width: W.time }}>{cellR(fmtDuration(elapsed()), W.time)}</text>
@@ -714,8 +746,9 @@ function ListScreen(props: ScreenProps & { sel: () => number }) {
               <text style={{ fg: t().text }}>{fmtClock(run.startedAt)}</text>
               <text style={{ fg: t().textMuted }}>{run.endedAt ? "   ended " : ""}</text>
               <text style={{ fg: t().text }}>{run.endedAt ? fmtClock(run.endedAt) : ""}</text>
-              <text style={{ fg: t().textMuted }}>   tokens </text>
-              <text style={{ fg: t().text }}>{fmtTokens(run.totalTokens)}</text>
+              <text style={{ fg: t().textMuted }}>   context </text>
+              <text style={{ fg: t().text }}>{fmtCtx(run.totalContextTokens)}</text>
+              <text style={{ fg: faint() }}>{`   billed ${fmtTokens(run.totalTokens)}`}</text>
               <text style={{ fg: t().textMuted }}>   cost </text>
               <text style={{ fg: t().text }}>{fmtCost(run.totalCost)}</text>
             </box>
@@ -784,7 +817,7 @@ function RunScreen(props: ScreenProps & { pane: () => Pane }) {
 
 function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
   const { api, store, run } = props
-  const { t, tone } = useTheme(api)
+  const { t, tone, faint } = useTheme(api)
   const width = () => store.size().width
   const narrow = () => width() < 110
   const phase = (): PhaseState | undefined => run.phases[store.selPhase()] ?? run.phases[0]
@@ -829,8 +862,9 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
   }
   const age = (at: number) => (at ? fmtAgo(at, store.now()) : "")
 
-  const A = { icon: 2, model: 20, tok: 9, tools: 10, time: 9 }
-  const labelW = () => Math.max(12, width() - phasesW() - 3 - 6 - A.icon - (narrow() ? 0 : A.model) - A.tok - A.tools - A.time)
+  // tok = CONTEXT (headline), billed = cumulative sent tokens (faint, wide only)
+  const A = { icon: 2, model: 20, tok: 9, billed: 9, tools: 10, time: 9 }
+  const labelW = () => Math.max(12, width() - phasesW() - 3 - 6 - A.icon - (narrow() ? 0 : A.model + A.billed) - A.tok - A.tools - A.time)
 
   const bottomTitle = () => (run.error ? " Error " : run.result ? " Result " : " Log ")
   // paddingTop(1) + header(4) + margin(1) + [body] + margin(1) + bottom(4) + hints(2) + host status line(1)
@@ -854,7 +888,9 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
         <box flexDirection="row" style={{ height: 1 }}>
           <Bar api={api} done={() => run.agentDone} total={() => run.agentCount} width={narrow() ? 14 : 24} tone={() => (run.status === "failed" ? "error" : run.status === "completed" ? "success" : "accent")} />
           <text style={{ fg: t().text }}>{` ${run.agentDone}/${run.agentCount} agents`}</text>
-          <text style={{ fg: t().textMuted }}>{`   ${fmtDuration(elapsed())}   ${fmtTokens(run.totalTokens)}   ${fmtCost(run.totalCost)}`}</text>
+          <text style={{ fg: t().textMuted }}>{`   ${fmtDuration(elapsed())}   ${fmtCtx(run.totalContextTokens)}`}</text>
+          <text style={{ fg: faint() }}>{`   billed ${fmtTokens(run.totalTokens)}`}</text>
+          <text style={{ fg: t().textMuted }}>{`   ${fmtCost(run.totalCost)}`}</text>
           <text style={{ flexGrow: 1 }} />
           <Show when={store.isStale(run)}>
             <text style={{ fg: t().warning }}>engine gone — state stopped updating</text>
@@ -937,7 +973,10 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
                       <Show when={!narrow()}>
                         <text style={{ fg: dim(), width: A.model }}>{cell(shortModel(a()!.model), A.model - 1)}</text>
                       </Show>
-                      <text style={{ fg: dim(), width: A.tok }}>{cellR(fmtTok(a()!.tokens), A.tok)}</text>
+                      <text style={{ fg: dim(), width: A.tok }}>{cellR(fmtCtxCell(a()!.contextTokens), A.tok)}</text>
+                      <Show when={!narrow()}>
+                        <text style={{ fg: faint(), width: A.billed }}>{cellR(fmtTok(a()!.tokens), A.billed)}</text>
+                      </Show>
                       <text style={{ fg: dim(), width: A.tools }}>{cellR(a()!.toolCalls ? `${a()!.toolCalls} tool${a()!.toolCalls === 1 ? "" : "s"}` : "", A.tools)}</text>
                       <text style={{ fg: a()!.status === "running" ? t().accent : dim(), width: A.time }}>{cellR(fmtElapsed(a()!.startedAt, a()!.endedAt, store.now()), A.time)}</text>
                     </box>
@@ -1038,7 +1077,7 @@ function AgentScreen(props: ScreenProps & { agentId: () => string; scrollRef: (e
 
 function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scrollRef: (el: ScrollBoxRenderable) => void }) {
   const { api, store, run, agent: a } = props
-  const { t, tone } = useTheme(api)
+  const { t, tone, faint } = useTheme(api)
   const width = () => store.size().width
   const bodyW = () => Math.max(30, width() - 8)
   const running = () => a.status === "running" || a.status === "queued"
@@ -1068,8 +1107,10 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
           <text style={{ fg: tone(statusTone(a.status)), attributes: BOLD }}>{statusLabel(a.status).toUpperCase()}</text>
         </box>
         <box flexDirection="row" style={{ height: 1 }}>
-          <text style={{ fg: t().text }}>{fmtTokens(a.tokens)}</text>
-          <text style={{ fg: t().textMuted }}>{`  (out ${fmtTok(a.outputTokens)})  ·  `}</text>
+          <text style={{ fg: t().textMuted }}>context </text>
+          <text style={{ fg: t().text }}>{fmtCtx(a.contextTokens)}</text>
+          <text style={{ fg: faint() }}>{`  (billed ${fmtTok(a.tokens)} · out ${fmtTok(a.outputTokens)})`}</text>
+          <text style={{ fg: t().textMuted }}>{`  ·  `}</text>
           <text style={{ fg: t().text }}>{fmtCost(a.cost)}</text>
           <text style={{ fg: t().textMuted }}>{`  ·  ${a.toolCalls} tool call${a.toolCalls === 1 ? "" : "s"}  ·  `}</text>
           <text style={{ fg: running() ? t().accent : t().text }}>{fmtElapsed(a.startedAt, a.endedAt, store.now())}</text>
@@ -1167,7 +1208,7 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
 
 function ResultScreen(props: ScreenProps & { scrollRef: (el: ScrollBoxRenderable) => void }) {
   const { api, store } = props
-  const { t, tone } = useTheme(api)
+  const { t, tone, faint } = useTheme(api)
   const width = () => store.size().width
   return (
     <box flexDirection="column" style={{ flexGrow: 1 }}>
@@ -1189,7 +1230,9 @@ function ResultScreen(props: ScreenProps & { scrollRef: (el: ScrollBoxRenderable
             <box flexDirection="column" style={{ flexGrow: 1, paddingLeft: 1, paddingRight: 1, paddingTop: 1 }}>
               <box flexDirection="row" style={{ paddingLeft: 1, height: 1 }}>
                 <text style={{ fg: t().primary, attributes: BOLD }}>Result</text>
-                <text style={{ fg: t().textMuted }}>{`  ${clip(run.name, 48)}  ·  ${run.agentDone}/${run.agentCount} agents  ·  ${fmtDuration(run.endedAt ? run.endedAt - run.startedAt : 0)}  ·  ${fmtTokens(run.totalTokens)}  ·  ${fmtCost(run.totalCost)}`}</text>
+                <text style={{ fg: t().textMuted }}>{`  ${clip(run.name, 48)}  ·  ${run.agentDone}/${run.agentCount} agents  ·  ${fmtDuration(run.endedAt ? run.endedAt - run.startedAt : 0)}  ·  ${fmtCtx(run.totalContextTokens)}`}</text>
+                <text style={{ fg: faint() }}>{`  ·  billed ${fmtTokens(run.totalTokens)}`}</text>
+                <text style={{ fg: t().textMuted }}>{`  ·  ${fmtCost(run.totalCost)}`}</text>
                 <text style={{ flexGrow: 1 }} />
                 <text style={{ fg: tone(statusTone(run.status)), attributes: BOLD }}>{statusLabel(run.status).toUpperCase()}</text>
               </box>

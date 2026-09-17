@@ -58,8 +58,18 @@ export interface AgentState {
   status: AgentStatus
   /** resolved model, e.g. "anthropic/claude-sonnet-4" or "qwen3.8" */
   model: string
-  /** tokens used so far (input+output+reasoning+cache reads) */
+  /**
+   * BILLED tokens: sum over every API call this agent made of
+   * input+output+reasoning+cache read/write. Each call re-sends the whole
+   * context, so this grows quadratically with tool-call count and is much
+   * larger than the context size. Matches `cost`.
+   */
   tokens: number
+  /**
+   * CONTEXT size: prompt tokens (input + cache read/write) of the LATEST API
+   * call, i.e. how big the agent's context actually is right now.
+   */
+  contextTokens: number
   outputTokens: number
   cost: number
   toolCalls: number
@@ -103,8 +113,10 @@ export interface RunState {
   agentDone: number
   startedAt: number
   endedAt?: number
-  /** total tokens across all agents */
+  /** total BILLED tokens across all agents (see AgentState.tokens) */
   totalTokens: number
+  /** sum of every agent's current context size (see AgentState.contextTokens) */
+  totalContextTokens: number
   totalCost: number
   /** resolved script path (for save) */
   scriptPath?: string

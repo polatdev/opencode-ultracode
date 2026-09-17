@@ -77,7 +77,7 @@ export class RunEngine {
   private controlTimer: any = null
   private agentSeq = 0
   private sessionToAgent = new Map<string, string>()
-  private sessionMsgTotals = new Map<string, Map<string, { t: number; o: number; c: number }>>()
+  private sessionMsgTotals = new Map<string, Map<string, { t: number; o: number; c: number; ctx: number }>>()
   private lastTextPart = new Map<string, string>()
   private sem = 0
   private semMax: number
@@ -121,22 +121,38 @@ export class RunEngine {
     const a = this.state.agents[agentId]
     if (!a) return
     const tk = tokenTotal(msg.tokens)
-    const entry = { t: Math.max(0, tk | 0), o: Math.max(0, Number(msg.tokens?.output ?? 0) | 0), c: typeof msg.cost === "number" ? msg.cost : 0 }
-    const per = this.sessionMsgTotals.get(msg.sessionID) ?? new Map<string, { t: number; o: number; c: number }>()
+    const entry = {
+      t: Math.max(0, tk | 0),
+      o: Math.max(0, Number(msg.tokens?.output ?? 0) | 0),
+      c: typeof msg.cost === "number" ? msg.cost : 0,
+      ctx: Math.max(0, contextTokens(msg.tokens) | 0),
+    }
+    const per = this.sessionMsgTotals.get(msg.sessionID) ?? new Map<string, { t: number; o: number; c: number; ctx: number }>()
     const prev = per.get(msg.id)
-    if (prev && prev.t === entry.t && prev.o === entry.o && prev.c === entry.c) return
+    if (prev && prev.t === entry.t && prev.o === entry.o && prev.c === entry.c && prev.ctx === entry.ctx) return
     per.set(msg.id, entry)
     this.sessionMsgTotals.set(msg.sessionID, per)
+    // billed = sum over all calls; context = prompt size of the latest call
+    // (message ids are time-ordered, so the greatest id is the newest call;
+    // a still-streaming message may report 0 until the provider fills it in,
+    // so keep the previous non-zero context in that case)
     let T = 0
     let O = 0
     let C = 0
-    for (const e of per.values()) {
+    let newestId = ""
+    let ctx = 0
+    for (const [id, e] of per) {
       T += e.t
       O += e.o
       C += e.c
+      if (id > newestId && e.ctx > 0) {
+        newestId = id
+        ctx = e.ctx
+      }
     }
     a.tokens = T
     a.outputTokens = O
+    a.contextTokens = ctx
     a.cost = C
     this.recount()
     this.markDirty()
@@ -228,6 +244,7 @@ export class RunEngine {
       agentDone: 0,
       startedAt: this.startedAt,
       totalTokens: 0,
+      totalContextTokens: 0,
       totalCost: 0,
       scriptPath: opts.scriptPath ?? (opts.name ? this.findSavedScript(opts.name) : undefined),
       directory: join(this.deps.opencodeDir, ".."),
@@ -272,6 +289,7 @@ export class RunEngine {
       runId: this.runId,
       agents: this.state.agentCount,
       tokens: this.state.totalTokens,
+      contextTokens: this.state.totalContextTokens,
       error: rawError ? String(rawError) : undefined,
     })
   }
@@ -375,6 +393,7 @@ export class RunEngine {
       status: "queued",
       model: model ? this.resolveModelLabel(model) : this.deps.defaultModel ?? "default",
       tokens: 0,
+      contextTokens: 0,
       outputTokens: 0,
       cost: 0,
       toolCalls: 0,
@@ -647,6 +666,7 @@ export class RunEngine {
     this.state.agentCount = agents.length
     this.state.agentDone = agents.filter((a) => a.status !== "queued" && a.status !== "running").length
     this.state.totalTokens = agents.reduce((s, a) => s + (a.tokens || 0), 0)
+    this.state.totalContextTokens = agents.reduce((s, a) => s + (a.contextTokens || 0), 0)
     this.state.totalCost = agents.reduce((s, a) => s + (a.cost || 0), 0)
   }
 
@@ -744,6 +764,12 @@ export class RunEngine {
 function tokenTotal(t: any): number {
   if (!t) return 0
   return (t.input ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0)
+}
+
+/** prompt size of one API call: everything the model read, minus what it wrote */
+function contextTokens(t: any): number {
+  if (!t) return 0
+  return (t.input ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0)
 }
 
 function finalText(parts: any[]): string {
