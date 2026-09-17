@@ -702,6 +702,13 @@ function statusGlyph(status: string | undefined, spinner: string): string {
   }
 }
 
+function activityTitle(a: AgentState): string {
+  const thoughts = a.activity.filter((x) => x.kind === "think").length
+  const tools = a.activity.length - thoughts
+  if (!thoughts) return `Activity · ${tools}`
+  return `Activity · ${tools} tool${tools === 1 ? "" : "s"} · ${thoughts} thought${thoughts === 1 ? "" : "s"}`
+}
+
 function statusLabel(status: string | undefined): string {
   return String(status ?? "pending")
 }
@@ -1380,7 +1387,7 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
               {(e) => (
                 <box flexDirection="row" style={{ height: 1 }}>
                   <text style={{ fg: t().textMuted, width: 8 }}>{cellR(`${age(e.at)}`, 7)}</text>
-                  <text style={{ fg: e.kind === "tool" ? t().accent : t().textMuted, width: 2 }}>{e.kind === "tool" ? "⚙" : "…"}</text>
+                  <text style={{ fg: e.kind === "tool" ? t().accent : t().textMuted, width: 2 }}>{e.kind === "tool" ? "⚙" : e.kind === "think" ? "∴" : "…"}</text>
                   <text style={{ fg: e.kind === "tool" ? t().text : t().textMuted }}>{clip(e.text, bodyW() - 12)}</text>
                 </box>
               )}
@@ -1398,15 +1405,15 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
           {/* activity */}
           <SectionTitle
             api={api}
-            title={`Activity · ${a.activity.length}`}
-            hint={() => (a.activity.length ? (store.expandActivity() ? "e hides previews" : "e shows previews") : "no tool calls yet")}
+            title={activityTitle(a)}
+            hint={() => (a.activity.length ? (store.expandActivity() ? "e hides previews" : "e shows previews") : "no activity yet")}
           />
           <For each={a.activity}>
             {(act) => (
               <box flexDirection="column">
                 <box flexDirection="row" style={{ height: 1 }}>
                   <text style={{ fg: act.endedAt ? t().success : t().accent, width: 2 }}>{act.endedAt ? "✓" : store.spinner()}</text>
-                  <text style={{ fg: t().text }}>{act.tool}</text>
+                  <text style={{ fg: act.kind === "think" ? t().textMuted : t().text }}>{act.tool}</text>
                   <text style={{ fg: t().textMuted }}>{act.title && act.title !== act.tool ? `  ${clip(oneLine(act.title), Math.max(10, bodyW() - act.tool.length - 14))}` : ""}</text>
                   <text style={{ flexGrow: 1 }} />
                   <text style={{ fg: t().textMuted }}>{fmtElapsed(act.startedAt, act.endedAt, store.now())}</text>

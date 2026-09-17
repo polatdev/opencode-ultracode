@@ -36,9 +36,11 @@ export interface PhaseState extends PhaseDef {
 }
 
 export interface AgentActivity {
+  /** "tool" (default) for tool calls, "think" for a reasoning/thinking block */
+  kind?: "tool" | "think"
   /** host tool-call id (when the host sends one) — used to match updates */
   callId?: string
-  /** tool name, e.g. "StructuredOutput" or "bash" */
+  /** tool name, e.g. "StructuredOutput" or "bash"; "think" for reasoning entries */
   tool: string
   /** short title / first words of the call */
   title: string
@@ -80,8 +82,8 @@ export interface AgentState {
   outcomeText?: string
   /** latest LLM text chunk seen while the agent is running (live view) */
   liveText?: string
-  /** recent live activity (text chunks + tool calls), newest last, capped */
-  liveFeed?: { at: number; kind: "text" | "tool"; text: string }[]
+  /** recent live activity (text chunks, thinking, tool calls), newest last, capped */
+  liveFeed?: { at: number; kind: "text" | "tool" | "think"; text: string }[]
   startedAt?: number
   endedAt?: number
   error?: string

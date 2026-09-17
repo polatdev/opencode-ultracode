@@ -241,7 +241,11 @@ export class RunEngine {
     if (!agentId) return
     const a = this.state.agents[agentId]
     if (!a) return
-    if (part?.type === "text" || part?.type === "reasoning") {
+    if (part?.type === "reasoning") {
+      this.onReasoningPart(a, part)
+      return
+    }
+    if (part?.type === "text") {
       const txt = typeof part?.text === "string" ? part.text : ""
       if (!txt.trim()) return
       a.liveText = txt.slice(-800)
@@ -274,7 +278,7 @@ export class RunEngine {
         preview: undefined,
         startedAt: Date.now(),
       })
-      a.toolCalls = a.activity.length
+      a.toolCalls = a.activity.filter((x) => x.kind !== "think").length
       this.pushLiveFeed(a, "tool", `${part.tool} ${title !== part.tool ? title : ""}`)
       this.recount()
       this.markDirty()
@@ -292,8 +296,45 @@ export class RunEngine {
     }
   }
 
-  private pushLiveFeed(a: AgentState, kind: "text" | "tool", text: string): void {
-    const line = String(text ?? "").trim().replace(/\s+/g, " ").slice(0, 160)
+  /**
+   * Thinking blocks become "think" activity rows: one per reasoning part,
+   * matched by part id. The row's title is the first line of the thought
+   * (empty when the provider hides the text), its duration comes from the
+   * part's own time.start/time.end so it is exact even when events lag.
+   */
+  private onReasoningPart(a: AgentState, part: any): void {
+    const pid = typeof part?.id === "string" ? part.id : undefined
+    if (!pid) return
+    const txt = typeof part?.text === "string" ? part.text : ""
+    const start = typeof part?.time?.start === "number" ? part.time.start : Date.now()
+    const end = typeof part?.time?.end === "number" ? part.time.end : undefined
+    const title = oneLine(txt).slice(0, 120)
+    const feedText = title ? `think · ${title}` : "think"
+    let act = a.activity.find((x) => x.kind === "think" && x.callId === pid)
+    if (!act) {
+      act = { kind: "think", callId: pid, tool: "think", title, startedAt: start }
+      a.activity.push(act)
+      this.pushLiveFeed(a, "think", feedText)
+    } else {
+      if (title) act.title = title
+      // keep the feed line for this thought fresh while the text streams
+      const feed = a.liveFeed ?? []
+      const f = [...feed].reverse().find((x) => x.kind === "think")
+      if (f && !act.endedAt) f.text = feedLine(feedText)
+    }
+    if (txt.trim()) act.preview = truncate(txt, 300)
+    if (end && !act.endedAt) {
+      act.endedAt = end
+      const feed = a.liveFeed ?? []
+      const f = [...feed].reverse().find((x) => x.kind === "think")
+      const dur = fmtSecs(end - act.startedAt)
+      if (f) f.text = feedLine(act.title ? `think ${dur} · ${act.title}` : `think ${dur}`)
+    }
+    this.markDirty()
+  }
+
+  private pushLiveFeed(a: AgentState, kind: "text" | "tool" | "think", text: string): void {
+    const line = feedLine(text)
     if (!line) return
     const feed = a.liveFeed ?? (a.liveFeed = [])
     feed.push({ at: Date.now(), kind, text: line })
@@ -967,4 +1008,13 @@ function toolTitle(tool: string, st: any): string {
 
 function oneLine(s: string): string {
   return s.replace(/\s+/g, " ").trim()
+}
+
+function feedLine(text: string): string {
+  return String(text ?? "").trim().replace(/\s+/g, " ").slice(0, 160)
+}
+
+function fmtSecs(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000))
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60 ? ` ${s % 60}s` : ""}`
 }
