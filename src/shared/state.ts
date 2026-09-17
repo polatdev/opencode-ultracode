@@ -86,6 +86,8 @@ export interface AgentState {
   endedAt?: number
   error?: string
   sessionId?: string
+  /** true when this agent's result was replayed from a previous run of the same runId (resume) */
+  replayed?: boolean
 }
 
 export interface RunLogEntry {
@@ -126,11 +128,30 @@ export interface RunState {
   error?: string
   /** the directory this run was created in */
   directory: string
+  /** opencode session that started the run; the result turn is delivered here (also after a resume) */
+  mainSessionID?: string
+  /** model the starting session used; agents without an explicit model inherit it (needed to resume) */
+  defaultModel?: string
+  /** the script's `args` value, kept so a resume re-runs the script with the same input */
+  args?: unknown
+  /** set when the run was resumed after its engine died (opencode exit/crash) */
+  resumedAt?: number
+  /** how many times the run has been resumed */
+  resumeCount?: number
 }
 
+/**
+ * control.json written by the TUI. A live engine polls it for pause/resume/stop.
+ * `resume` on a run with no live engine (opencode exited while it ran) asks the
+ * server plugin to restart the run: completed agents replay from the journal,
+ * the rest run again.
+ */
 export interface ControlState {
+  action?: "pause" | "resume" | "stop"
   pause?: boolean
+  resume?: boolean
   stop?: boolean
+  at?: number
 }
 
 // --- wire helpers -----------------------------------------------------------

@@ -189,7 +189,12 @@ export const plugin: TuiPluginModule = {
     }
     const doPause = (run: RunState | undefined) => {
       if (!run) return
-      if (run.status === "running") {
+      if (store.isStale(run) || run.status === "stopped" || run.status === "failed") {
+        // no live engine: the server plugin picks the request up and restarts
+        // the run in place (completed agents replay from the journal)
+        store.control(run.runId, "resume")
+        api.ui.toast({ variant: "info", message: `Resume requested for ${run.name} — completed agents replay, the rest run again` })
+      } else if (run.status === "running") {
         store.control(run.runId, "pause")
         api.ui.toast({ variant: "info", message: `Pausing ${run.name}…` })
       } else if (run.status === "paused") {
@@ -519,6 +524,13 @@ function statusLabel(status: string | undefined): string {
   return String(status ?? "pending")
 }
 
+/** what `p` does for this run */
+function pauseLabel(store: WorkflowStore, run: RunState | undefined): string {
+  if (!run) return "pause"
+  if (store.isStale(run) || run.status === "paused" || run.status === "stopped" || run.status === "failed") return "resume"
+  return "pause"
+}
+
 /** status as the UI should present it — a live run with a dead engine is "stale" */
 function shownStatus(store: WorkflowStore, run: RunState): string {
   return store.isStale(run) ? "stale" : run.status
@@ -780,7 +792,7 @@ function ListScreen(props: ScreenProps & { sel: () => number }) {
             ["⏎", "open"],
             ["r", "result"],
             ["x", "stop"],
-            ["p", selected()?.status === "paused" ? "resume" : "pause"],
+            ["p", pauseLabel(store, selected())],
             ["s", "save script"],
             ["d", "delete"],
             ["esc", "back"],
@@ -892,11 +904,14 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
           <text style={{ fg: faint() }}>{`   billed ${fmtTokens(run.totalTokens)}`}</text>
           <text style={{ fg: t().textMuted }}>{`   ${fmtCost(run.totalCost)}`}</text>
           <text style={{ flexGrow: 1 }} />
-          <Show when={store.isStale(run)}>
-            <text style={{ fg: t().warning }}>engine gone — state stopped updating</text>
+          <Show when={store.pendingControl(run.runId) === "resume"}>
+            <text style={{ fg: t().warning }}>resume requested — waiting for the engine…</text>
           </Show>
-          <Show when={run.status === "paused" && !store.isStale(run)}>
-            <text style={{ fg: t().warning }}>paused — p resumes</text>
+          <Show when={store.pendingControl(run.runId) !== "resume" && store.isStale(run)}>
+            <text style={{ fg: t().warning }}>engine gone — p resumes</text>
+          </Show>
+          <Show when={store.pendingControl(run.runId) !== "resume" && !store.isStale(run) && (run.status === "paused" || run.status === "stopped")}>
+            <text style={{ fg: t().warning }}>{`${run.status} — p resumes`}</text>
           </Show>
           <Show when={run.status !== "paused" && !store.isStale(run) && !narrow()}>
             <text style={{ fg: t().textMuted }}>{clip(modelsOf(run), 40)}</text>
@@ -1040,7 +1055,7 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
             ["⏎", props.pane() === "phases" ? "agents" : "open agent"],
             ["r", "result"],
             ["x", "stop"],
-            ["p", run.status === "paused" ? "resume" : "pause"],
+            ["p", pauseLabel(store, run)],
             ["s", "save"],
             ["esc", "back"],
           ]}

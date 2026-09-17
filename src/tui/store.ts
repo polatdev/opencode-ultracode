@@ -39,6 +39,8 @@ export interface WorkflowStore {
 
   runsDir: () => string
   control: (runId: string, action: "pause" | "resume" | "stop") => void
+  /** a control.json the engine has not consumed yet (e.g. resume waiting for the server plugin) */
+  pendingControl: (runId: string) => "pause" | "resume" | "stop" | undefined
   deleteRun: (runId: string) => void
   saveScript: (run: RunState) => string | undefined
   markNotified: (runId: string) => void
@@ -222,6 +224,16 @@ export function createStore(api: TuiPluginApi, onDispose?: (fn: () => void) => v
         mkdirSync(join(runsDir(), runId), { recursive: true })
         writeFileSync(controlPath(runsDir(), runId), JSON.stringify({ action, at: Date.now() }))
       } catch {}
+    },
+    pendingControl: (runId) => {
+      now() // re-evaluate each clock tick
+      try {
+        const raw = readFileSync(controlPath(runsDir(), runId), "utf8")
+        const a = JSON.parse(raw)?.action
+        return a === "pause" || a === "resume" || a === "stop" ? a : undefined
+      } catch {
+        return undefined
+      }
     },
     deleteRun: (runId) => {
       try {

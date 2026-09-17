@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import assert from "node:assert"
-import { generateRunId, RunEngine } from "./engine.ts"
+import { generateRunId, loadPriorRun, RunEngine } from "./engine.ts"
 import { parseScript } from "./script.ts"
 
 const tmp = mkdtempSync(join(tmpdir(), "wf-selftest-"))
@@ -13,6 +13,7 @@ const opencodeDir = join(tmp, ".opencode")
 const runsRoot = join(tmp, "runs")
 
 let sessionSeq = 0
+let promptCount = 0
 const seenSessions: string[] = []
 
 const fakeClient = {
@@ -24,6 +25,7 @@ const fakeClient = {
       return { id, parentID: args.body?.parentID }
     },
     async prompt(args: any) {
+      promptCount++
       const id = args.path.id
       const text = String(args.body?.parts?.[0]?.text ?? "")
       console.log(`  [mock] session.prompt  ${id} model=${args.body?.model ? JSON.stringify(args.body.model) : "(inherit)"} chars=${text.length}`)
@@ -262,7 +264,55 @@ return out
   assert.equal(failed.length, 0, "pipeline stage throw should drop item, not fail agent (agent itself succeeded)")
   console.log("  ok: pipeline stages, item drop on stage error, parallel null on reject")
 
-  console.log(`\nALL TESTS PASSED (${Date.now() - t0}ms total, tmp=${tmp})`)
+    // ---- test 5: resume after the engine died ----------------------------------
+  console.log("test 5: resume a stopped run (completed agents replay from the journal)")
+  {
+    const rid = generateRunId()
+    const deps = { client: fakeClient as any, opencodeDir, runsRoot, mainSessionID: "ses_main", defaultModel: "mock/sonnet", availableModels: new Set(["mock/sonnet"]) }
+    const e1 = new RunEngine(deps, rid)
+    // make the synthesis agent die mid-run: stop the run once the Generate phase is done
+    const origPrompt = fakeClient.session.prompt
+    let calls = 0
+    fakeClient.session.prompt = async (args: any) => {
+      calls++
+      if (calls === 4) {
+        e1.shutdown("opencode exited while the workflow was running")
+        throw new Error("connection closed")
+      }
+      return origPrompt(args)
+    }
+    const r1 = await e1.run({ script: DEMO, args: { extra: 7 } })
+    fakeClient.session.prompt = origPrompt
+    assert.equal(r1.status, "stopped", `expected stopped, got ${r1.status} (${r1.error})`)
+    const s1: any = JSON.parse(readFileSync(join(runsRoot, rid, "state.json"), "utf8"))
+    assert.equal(s1.mainSessionID, "ses_main")
+    assert.deepEqual(s1.args, { extra: 7 })
+    const done1 = Object.values(s1.agents).filter((a: any) => a.status === "completed").length
+    assert.equal(done1, 3, `3 tip agents should have completed before the stop (got ${done1})`)
+
+    const prior = loadPriorRun(runsRoot, rid)
+    assert.ok(prior, "prior run loads")
+    assert.equal(prior!.replayable, 3)
+    const before = promptCount
+    const e2 = new RunEngine(deps, rid)
+    const r2 = await e2.run({ resume: prior! })
+    assert.equal(r2.status, "completed", `resumed run should complete, error=${r2.error}`)
+    assert.equal(promptCount - before, 1, "only the synthesis agent should call the model again")
+    const s2: any = JSON.parse(readFileSync(join(runsRoot, rid, "state.json"), "utf8"))
+    const replayed = Object.values(s2.agents).filter((a: any) => a.replayed).length
+    assert.equal(replayed, 3, "3 agents replayed")
+    assert.equal(s2.agentCount, 4)
+    assert.equal(s2.resumeCount, 1)
+    assert.equal(s2.startedAt, s1.startedAt, "original start time kept")
+    assert.ok(s2.logs.some((l: any) => /paused|stopped|exited/.test(l.message)), "prior logs carried over")
+    assert.ok(s2.logs.some((l: any) => /^resumed \(3 completed agents replay/.test(l.message)), "resume log line")
+    const final = JSON.parse(r2.result!)
+    assert.equal(final.tips.length, 3, "replayed results feed the rest of the script")
+    assert.ok(!s2.error, "error cleared on successful resume")
+    console.log(`  ok: resume replayed ${replayed} agents, re-ran 1, completed`)
+  }
+
+console.log(`\nALL TESTS PASSED (${Date.now() - t0}ms total, tmp=${tmp})`)
 }
 
 main().catch((e) => {

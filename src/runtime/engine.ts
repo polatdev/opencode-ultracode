@@ -3,6 +3,7 @@
 // writing to /tmp/opencode-workflows/<project>/<runId>/state.json, pause/stop control.
 
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync, existsSync, rmSync } from "node:fs"
+import { createHash } from "node:crypto"
 import { cpus } from "node:os"
 import { join } from "node:path"
 import {
@@ -47,6 +48,82 @@ export interface RunOptions {
   name?: string
   args?: any
   budgetTotal?: number | null
+  /**
+   * Resume a run whose engine died (opencode exited/crashed, or it was stopped).
+   * The engine must be constructed with the SAME runId. The prior script is
+   * re-executed; every agent() whose (phase, label, prompt) matches a completed
+   * agent of the prior run returns that agent's journaled result instantly and
+   * is marked `replayed`. Everything else runs for real.
+   */
+  resume?: PriorRun
+}
+
+/** what loadPriorRun() recovers from a run folder for a resume */
+export interface PriorRun {
+  state: RunState
+  script: string
+  /** replay key (see replayKey) -> journaled results + agent snapshots, in spawn order */
+  replay: Map<string, Array<{ result: any; agent: AgentState }>>
+  /** completed agents that can be replayed */
+  replayable: number
+}
+
+/** agents are matched across runs by where they ran and what they were asked */
+function replayKey(phase: string, label: string, prompt: string): string {
+  return `${phase}\u0000${label}\u0000${createHash("sha1").update(prompt).digest("hex")}`
+}
+
+/**
+ * Read a finished/stopped run's folder so it can be resumed in place. Returns
+ * undefined when the folder has no usable state or script. Results come from
+ * journal.jsonl (`agent-done` entries carry the full value); the state file
+ * supplies prompts and token/cost snapshots. A result that was truncated in
+ * the journal is not replayable, so that agent simply runs again.
+ */
+export function loadPriorRun(runsRootDir: string, runId: string): PriorRun | undefined {
+  let state: RunState
+  let script: string
+  try {
+    state = JSON.parse(readFileSync(statePath(runsRootDir, runId), "utf8"))
+    script = readFileSync(join(runDir(runsRootDir, runId), "script.js"), "utf8")
+  } catch {
+    return undefined
+  }
+  if (!state || typeof state !== "object" || !state.agents || !script) return undefined
+  const results = new Map<string, any>()
+  try {
+    for (const line of readFileSync(journalPath(runsRootDir, runId), "utf8").split("\n")) {
+      if (!line) continue
+      let e: any
+      try {
+        e = JSON.parse(line)
+      } catch {
+        continue
+      }
+      if (e?.type !== "agent-done" || e.status !== "completed" || typeof e.result !== "string") continue
+      try {
+        results.set(e.id, JSON.parse(e.result))
+      } catch {
+        // truncated or otherwise unparsable → not replayable
+      }
+    }
+  } catch {}
+  const replay = new Map<string, Array<{ result: any; agent: AgentState }>>()
+  let replayable = 0
+  for (const id of state.agentOrder ?? Object.keys(state.agents)) {
+    const a = state.agents[id]
+    if (!a || a.status !== "completed") continue
+    let result: any
+    if (results.has(id)) result = results.get(id)
+    else if (a.outcome !== undefined) result = a.outcome
+    else continue
+    const key = replayKey(a.phase, a.label, a.prompt ?? "")
+    const list = replay.get(key) ?? []
+    list.push({ result, agent: a })
+    replay.set(key, list)
+    replayable++
+  }
+  return { state, script, replay, replayable }
 }
 
 export class RunAbortedError extends Error {
@@ -83,6 +160,7 @@ export class RunEngine {
   private semMax: number
   private waiters: Array<() => void> = []
   private stoppedAgents = new Set<string>()
+  private replay: Map<string, Array<{ result: any; agent: AgentState }>> | undefined
   private startedAt: number
   private resolveModelLabel: (m: ModelRef) => string
 
@@ -226,6 +304,13 @@ export class RunEngine {
 
   async run(opts: RunOptions): Promise<{ runId: string; status: RunStatus; name: string; error?: string; result?: string }> {
     mkdirSync(this.runDir, { recursive: true })
+    const prior = opts.resume
+    if (prior) {
+      if (prior.state.runId !== this.runId) throw new Error(`resume: engine runId ${this.runId} does not match prior run ${prior.state.runId}`)
+      opts = { ...opts, script: prior.script, scriptPath: undefined, name: undefined, args: opts.args ?? prior.state.args }
+      this.replay = prior.replay
+      this.startedAt = prior.state.startedAt || this.startedAt
+    }
     const parsed = this.resolveScript(opts)
     const meta = parsed.meta
     const total = countAgents(meta)
@@ -248,8 +333,21 @@ export class RunEngine {
       totalCost: 0,
       scriptPath: opts.scriptPath ?? (opts.name ? this.findSavedScript(opts.name) : undefined),
       directory: join(this.deps.opencodeDir, ".."),
+      mainSessionID: this.deps.mainSessionID || undefined,
+      defaultModel: this.deps.defaultModel,
+      args: opts.args,
     }
-    this.writeJournal({ type: "run-start", runId: this.runId, name: meta.name, agentEstimate: total, at: this.startedAt })
+    if (prior) {
+      // keep the story of the run: earlier logs, then a marker for this resume
+      this.state.logs = (prior.state.logs ?? []).slice(-150)
+      this.state.scriptPath = prior.state.scriptPath
+      this.state.resumedAt = Date.now()
+      this.state.resumeCount = (prior.state.resumeCount ?? 0) + 1
+      this.logLine("log", `resumed (${prior.replayable} completed agent${prior.replayable === 1 ? "" : "s"} replay from the journal, the rest run again)`)
+      this.writeJournal({ type: "run-start", runId: this.runId, name: meta.name, agentEstimate: total, at: Date.now(), resumed: true, replayable: prior.replayable })
+    } else {
+      this.writeJournal({ type: "run-start", runId: this.runId, name: meta.name, agentEstimate: total, at: this.startedAt })
+    }
     this.flushNow()
 
     this.heartbeat = setInterval(() => this.markDirty(), 2000)
@@ -409,6 +507,28 @@ export class RunEngine {
     this.markDirty()
     this.writeJournal({ type: "agent-start", id, label, phase: phaseTitle, at: Date.now() })
 
+    const hit = this.takeReplay(phaseTitle, label, agent.prompt)
+    if (hit) {
+      const p = hit.agent
+      agent.status = "completed"
+      agent.replayed = true
+      agent.model = p.model || agent.model
+      agent.tokens = p.tokens || 0
+      agent.contextTokens = p.contextTokens || 0
+      agent.outputTokens = p.outputTokens || 0
+      agent.cost = p.cost || 0
+      agent.toolCalls = p.toolCalls || 0
+      agent.activity = Array.isArray(p.activity) ? p.activity : []
+      agent.outcome = p.outcome
+      agent.outcomeText = p.outcomeText ?? truncate(typeof hit.result === "string" ? hit.result : JSON.stringify(hit.result, null, 2), 4000)
+      agent.sessionId = p.sessionId
+      agent.startedAt = p.startedAt
+      agent.endedAt = p.endedAt ?? Date.now()
+      this.onAgentTerminal(agent)
+      this.writeJournal({ type: "agent-done", id, status: "completed", replayed: true, result: truncate(JSON.stringify(hit.result ?? null), 100_000), at: Date.now() })
+      return hit.result
+    }
+
     await this.acquireSem()
     try {
       if (this.stopRequested) {
@@ -507,6 +627,14 @@ export class RunEngine {
       at: Date.now(),
     })
     return value
+  }
+
+  /** pop the next journaled result for this (phase, label, prompt), if resuming */
+  private takeReplay(phase: string, label: string, prompt: string): { result: any; agent: AgentState } | undefined {
+    if (!this.replay) return undefined
+    const list = this.replay.get(replayKey(phase, label, prompt))
+    if (!list?.length) return undefined
+    return list.shift()
   }
 
   private onAgentTerminal(_agent: AgentState): void {
