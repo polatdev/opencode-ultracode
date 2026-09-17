@@ -224,4 +224,4 @@ skills/workflow-authoring/SKILL.md
 
 ## License
 
-Not yet specified.
+[MIT](LICENSE)
