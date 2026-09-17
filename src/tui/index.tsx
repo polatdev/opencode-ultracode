@@ -31,6 +31,7 @@ import {
 } from "../shared/format.ts"
 import type { AgentState, PhaseState, RunState } from "../shared/state.ts"
 import { createStore, isLive, type WorkflowStore } from "./store.ts"
+import { createRequestStore, describeRequest, type PendingRequest, type PermissionReply, type RequestStore } from "./requests.ts"
 
 // opentui TextAttributes bit flags (avoid a runtime import of @opentui/core)
 const BOLD = 1
@@ -43,6 +44,8 @@ export const plugin: TuiPluginModule = {
   id: "opencode-workflow",
   tui: async (api) => {
     const store = createStore(api, (fn) => api.lifecycle.onDispose(fn))
+    // pending permission / question requests of sub-agent sessions (see requests.ts)
+    const reqs = createRequestStore(api, (fn) => api.lifecycle.onDispose(fn))
 
     // selection state shared across views
     const [listSel, setListSel] = createSignal(0)
@@ -223,7 +226,162 @@ export const plugin: TuiPluginModule = {
       api.ui.toast({ variant: "success", message: `Deleted run: ${run.name}` })
     }
 
+    // --- permission / question requests -------------------------------------------
+
+    /** the run and agent that own a request's session, if it is one of ours */
+    const ownerOf = (p: PendingRequest): { run: RunState; agent: AgentState } | undefined => {
+      for (const r of runs()) {
+        for (const id of r.agentOrder) {
+          const a = r.agents[id]
+          if (a?.sessionId === p.sessionID) return { run: r, agent: a }
+        }
+      }
+      return undefined
+    }
+
+    /** first agent (newest run first) that is blocked on a request */
+    const firstWaiting = (): { run: RunState; agent: AgentState } | undefined => {
+      for (const r of runs()) {
+        const a = reqs.waitingAgents(r)[0]
+        if (a) return { run: r, agent: a }
+      }
+      return undefined
+    }
+
+    /** `!` — jump to the first agent that needs an answer and open the dialog */
+    const gotoWaiting = () => {
+      const hit = firstWaiting()
+      if (!hit) {
+        const other = reqs.unattributed(runs()).length
+        api.ui.toast({
+          variant: "info",
+          message: other ? `No workflow agent is waiting — ${other} request${other === 1 ? "" : "s"} pending in the chat session (esc to go back)` : "No agent is waiting for permission",
+        })
+        return
+      }
+      if (store.activeRunId() !== hit.run.runId) store.openRun(hit.run.runId)
+      const phaseIdx = hit.run.phases.findIndex((p) => p.title === hit.agent.phase)
+      if (phaseIdx >= 0) store.setSelPhase(phaseIdx)
+      openAgent(hit.agent.id)
+      respond(hit.agent)
+    }
+
+    const sendPermission = (agent: AgentState, p: PendingRequest, reply: PermissionReply) => {
+      api.ui.dialog.clear()
+      reqs.replyPermission(p.id, reply).then((ok) => {
+        if (!ok) return
+        const verb = reply === "reject" ? "Rejected" : reply === "always" ? "Allowed (always)" : "Allowed once"
+        api.ui.toast({ variant: reply === "reject" ? "warning" : "success", message: `${verb}: ${clip(describeRequest(p), 60)} — ${agent.label}` })
+      })
+    }
+
+    const permissionDialog = (agent: AgentState, p: Extract<PendingRequest, { kind: "permission" }>) => {
+      const patterns = (p.req.patterns ?? []).filter(Boolean)
+      const remember = (p.req.always ?? []).filter(Boolean)
+      const what = patterns.join(", ") || p.req.permission
+      const meta = p.req.metadata ?? {}
+      const detail = [meta.description, meta.hint, meta.command, meta.filepath, meta.path]
+        .filter((v) => typeof v === "string" && v.trim())
+        .map((v) => String(v))
+        .join(" · ")
+      api.ui.dialog.replace(() => (
+        <api.ui.DialogSelect
+          title={`${p.req.permission} · ${clip(agent.label, 32)}`}
+          placeholder={clip(detail || what, 70)}
+          flat
+          skipFilter
+          options={[
+            { title: "Allow once", value: "once", description: clip(what, 80) },
+            {
+              title: "Allow always",
+              value: "always",
+              description: remember.length ? `remember ${clip(remember.join(", "), 70)}` : "remember this permission for the rest of the session",
+            },
+            { title: "Reject", value: "reject", description: "the agent is told no and continues without it" },
+          ]}
+          onSelect={(o) => sendPermission(agent, p, o.value as PermissionReply)}
+        />
+      ))
+    }
+
+    /** ask the agent's questions one after another, then send all answers */
+    const questionDialog = (agent: AgentState, p: Extract<PendingRequest, { kind: "question" }>, idx = 0, answers: string[][] = []) => {
+      const qs = p.req.questions ?? []
+      const q = qs[idx]
+      if (!q) {
+        api.ui.dialog.clear()
+        reqs.replyQuestion(p.id, answers).then((ok) => ok && api.ui.toast({ variant: "success", message: `Answered ${agent.label}` }))
+        return
+      }
+      const next = (answer: string[]) => questionDialog(agent, p, idx + 1, [...answers, answer])
+      const options: Array<{ title: string; value: string; description?: string }> = q.options.map((o) => ({ title: o.label, value: `opt:${o.label}`, description: o.description }))
+      if (q.custom !== false) options.push({ title: "Type an answer…", value: "__custom", description: "free-text reply" })
+      options.push({ title: "Reject question", value: "__reject", description: "the agent continues without an answer" })
+      api.ui.dialog.replace(() => (
+        <api.ui.DialogSelect
+          title={`${q.header || "Question"}${qs.length > 1 ? ` (${idx + 1}/${qs.length})` : ""} · ${clip(agent.label, 28)}`}
+          placeholder={clip(q.question, 90)}
+          flat
+          skipFilter
+          options={options}
+          onSelect={(o) => {
+            if (o.value === "__reject") {
+              api.ui.dialog.clear()
+              reqs.rejectQuestion(p.id).then((ok) => ok && api.ui.toast({ variant: "warning", message: `Rejected question from ${agent.label}` }))
+              return
+            }
+            if (o.value === "__custom") {
+              api.ui.dialog.replace(() => (
+                <api.ui.DialogPrompt
+                  title={clip(q.question, 70)}
+                  placeholder="your answer"
+                  onConfirm={(v) => next([v])}
+                  onCancel={() => api.ui.dialog.clear()}
+                />
+              ))
+              return
+            }
+            next([o.value.slice("opt:".length)])
+          }}
+        />
+      ))
+    }
+
+    /** ⏎ in the agent view: answer the oldest request this agent is blocked on */
+    const respond = (agent: AgentState | undefined) => {
+      if (!agent) return
+      const p = reqs.forAgent(agent)[0]
+      if (!p) {
+        api.ui.toast({ variant: "info", message: `${agent.label} is not waiting for anything` })
+        return
+      }
+      if (p.kind === "permission") permissionDialog(agent, p)
+      else questionDialog(agent, p)
+    }
+
+    // a request that arrives while we are on screen: say so, point at the key
+    reqs.onNew((p) => {
+      if (!isOurRoute(api.route.current.name)) return
+      const owner = ownerOf(p)
+      api.ui.toast({
+        variant: "warning",
+        title: owner ? `${owner.agent.label} needs permission` : "Permission needed in chat",
+        message: owner ? `${clip(describeRequest(p), 70)} — press ! to answer` : `${clip(describeRequest(p), 70)} — esc returns to the session`,
+        duration: 8000,
+      })
+    })
+
     // --- keymap -------------------------------------------------------------------
+
+    // while one of our dialogs is up, the view keys underneath must stay quiet
+    const guarded = <T extends { run: () => unknown }>(cmds: T[]): T[] =>
+      cmds.map((c) => ({
+        ...c,
+        run: () => {
+          if (api.ui.dialog.open) return
+          return c.run()
+        },
+      }))
 
     api.keymap.registerLayer({
       commands: [
@@ -236,6 +394,10 @@ export const plugin: TuiPluginModule = {
           desc: "Open workflow runs",
           run: () => openWorkflows(),
         },
+        ...guarded([
+        // requests
+        { name: "wf.waiting", run: () => gotoWaiting() },
+        { name: "wf.agent.respond", run: () => respond(activeRun()?.agents[agentOpenId()]) },
         // list
         { name: "wf.list.up", run: () => void setListSel((v) => Math.max(0, v - 1)) },
         { name: "wf.list.down", run: () => void setListSel((v) => Math.min(Math.max(0, runs().length - 1), v + 1)) },
@@ -284,6 +446,7 @@ export const plugin: TuiPluginModule = {
         { name: "wf.result.pageDown", run: () => scrollBy(resultScroll, pageOf(resultScroll)) },
         { name: "wf.result.top", run: () => resultScroll?.scrollTo(0) },
         { name: "wf.result.back", run: () => goBack() },
+        ]),
       ],
       bindings: [{ key: "ctrl+shift+w", cmd: "workflows.open", desc: "Open workflows" }],
     })
@@ -305,6 +468,7 @@ export const plugin: TuiPluginModule = {
         { key: "s", cmd: "wf.list.save" },
         { key: "d", cmd: "wf.list.delete" },
         { key: "r", cmd: "wf.list.result" },
+        { key: "!", cmd: "wf.waiting" },
         { key: "escape", cmd: "wf.list.back" },
       ],
     })
@@ -325,6 +489,7 @@ export const plugin: TuiPluginModule = {
         { key: "p", cmd: "wf.run.pause" },
         { key: "s", cmd: "wf.run.save" },
         { key: "r", cmd: "wf.run.result" },
+        { key: "!", cmd: "wf.waiting" },
         { key: "escape", cmd: "wf.run.back" },
       ],
     })
@@ -343,6 +508,8 @@ export const plugin: TuiPluginModule = {
         { key: "l", cmd: "wf.agent.next" },
         { key: "e", cmd: "wf.agent.expand" },
         { key: "p", cmd: "wf.agent.prompt" },
+        { key: "enter", cmd: "wf.agent.respond" },
+        { key: "!", cmd: "wf.waiting" },
         { key: "escape", cmd: "wf.agent.back" },
       ],
     })
@@ -367,14 +534,14 @@ export const plugin: TuiPluginModule = {
         name: "workflows",
         render: () => {
           onCleanup(api.mode.push("wf.list"))
-          return (<ListScreen api={api} store={store} sel={listSel} />) as any
+          return (<ListScreen api={api} store={store} reqs={reqs} sel={listSel} />) as any
         },
       },
       {
         name: "workflow",
         render: () => {
           onCleanup(api.mode.push("wf.run"))
-          return (<RunScreen api={api} store={store} pane={pane} />) as any
+          return (<RunScreen api={api} store={store} reqs={reqs} pane={pane} />) as any
         },
       },
       {
@@ -383,7 +550,7 @@ export const plugin: TuiPluginModule = {
           onCleanup(api.mode.push("wf.agent"))
           onCleanup(() => (agentScroll = undefined))
           return (
-            <AgentScreen api={api} store={store} agentId={agentOpenId} scrollRef={(el) => (agentScroll = el)} />
+            <AgentScreen api={api} store={store} reqs={reqs} agentId={agentOpenId} scrollRef={(el) => (agentScroll = el)} />
           ) as any
         },
       },
@@ -392,7 +559,7 @@ export const plugin: TuiPluginModule = {
         render: () => {
           onCleanup(api.mode.push("wf.result"))
           onCleanup(() => (resultScroll = undefined))
-          return (<ResultScreen api={api} store={store} scrollRef={(el) => (resultScroll = el)} />) as any
+          return (<ResultScreen api={api} store={store} reqs={reqs} scrollRef={(el) => (resultScroll = el)} />) as any
         },
       },
     ])
@@ -425,6 +592,18 @@ export const plugin: TuiPluginModule = {
 interface ScreenProps {
   api: TuiPluginApi
   store: WorkflowStore
+  reqs: RequestStore
+}
+
+/** agent status as the UI presents it — a running agent blocked on a request is "waiting" */
+function agentShownStatus(reqs: RequestStore, a: AgentState | undefined): string | undefined {
+  if (!a) return undefined
+  return reqs.forAgent(a).length ? "waiting" : a.status
+}
+
+/** ⚠ N agents need permission */
+function waitingLabel(n: number): string {
+  return `⚠ ${n} agent${n === 1 ? "" : "s"} need${n === 1 ? "s" : ""} permission`
 }
 
 /**
@@ -492,6 +671,7 @@ function statusTone(status: string | undefined): Tone {
     case "cancelled":
     case "paused":
     case "stale":
+    case "waiting":
       return "warning"
     case "running":
       return "accent"
@@ -513,6 +693,8 @@ function statusGlyph(status: string | undefined, spinner: string): string {
       return "‖"
     case "stale":
       return "?"
+    case "waiting":
+      return "⚠"
     case "running":
       return spinner
     default:
@@ -644,10 +826,14 @@ function modelsOf(run: RunState): string {
 // =============================================================================
 
 function ListScreen(props: ScreenProps & { sel: () => number }) {
-  const { api, store } = props
+  const { api, store, reqs } = props
   const { t, tone, faint } = useTheme(api)
   const runs = store.runs
   const live = () => runs().filter((r) => isLive(r.status) && !store.isStale(r)).length
+  const waiting = () => runs().reduce((n, r) => n + reqs.waitingAgents(r).length, 0)
+  const waitingElsewhere = () => reqs.unattributed(runs()).length
+  /** run status with a blocked agent surfaced as "waiting" */
+  const rowStatus = (run: RunState) => (run.status === "running" && !store.isStale(run) && reqs.waitingAgents(run).length ? "waiting" : shownStatus(store, run))
   const wide = () => store.size().width >= 124
   // CONTEXT = live prompt size (headline); BILLED = cumulative tokens sent, faint
   const W = { icon: 2, status: 11, bar: 10, count: 8, tok: 9, billed: 9, cost: 9, time: 9, ago: 11 }
@@ -668,6 +854,12 @@ function ListScreen(props: ScreenProps & { sel: () => number }) {
         <text style={{ fg: t().primary, attributes: BOLD }}>Workflows</text>
         <text style={{ fg: t().textMuted }}>{`  ${clip(projectName(api), 40)}`}</text>
         <text style={{ flexGrow: 1 }} />
+        <Show when={waiting() > 0}>
+          <text style={{ fg: t().warning, attributes: BOLD }}>{`${waitingLabel(waiting())} — ! answers   `}</text>
+        </Show>
+        <Show when={waiting() === 0 && waitingElsewhere() > 0}>
+          <text style={{ fg: t().warning }}>{`⚠ ${waitingElsewhere()} permission${waitingElsewhere() === 1 ? "" : "s"} pending in chat — esc   `}</text>
+        </Show>
         <Show when={live() > 0}>
           <text style={{ fg: t().accent }}>{`${store.spinner()} ${live()} running   `}</text>
         </Show>
@@ -714,11 +906,11 @@ function ListScreen(props: ScreenProps & { sel: () => number }) {
                   flexDirection="row"
                   style={{ paddingLeft: 1, paddingRight: 1, height: 1, backgroundColor: isSel() ? t().backgroundElement : "transparent" }}
                 >
-                  <Glyph api={api} store={store} status={() => shownStatus(store, run)} width={W.icon} />
+                  <Glyph api={api} store={store} status={() => rowStatus(run)} width={W.icon} />
                   <text style={{ fg: isSel() ? t().accent : t().text, width: nameW(), attributes: isSel() ? BOLD : 0 }}>
                     {cell(run.name, nameW() - 1)}
                   </text>
-                  <text style={{ fg: tone(statusTone(shownStatus(store, run))), width: W.status }}>{cell(statusLabel(shownStatus(store, run)), W.status)}</text>
+                  <text style={{ fg: tone(statusTone(rowStatus(run))), width: W.status, attributes: rowStatus(run) === "waiting" ? BOLD : 0 }}>{cell(statusLabel(rowStatus(run)), W.status)}</text>
                   <Bar api={api} done={() => run.agentDone} total={() => run.agentCount} width={W.bar - 1} tone={() => (run.status === "failed" ? "error" : run.status === "completed" ? "success" : "accent")} />
                   <text style={{ fg: dim(), width: W.count + 1 }}>{` ${run.agentDone}/${run.agentCount}`}</text>
                   <text style={{ fg: dim(), width: W.tok }}>{cellR(fmtCtxCell(run.totalContextTokens), W.tok)}</text>
@@ -795,6 +987,7 @@ function ListScreen(props: ScreenProps & { sel: () => number }) {
             ["p", pauseLabel(store, selected())],
             ["s", "save script"],
             ["d", "delete"],
+            ...(waiting() > 0 ? ([["!", "answer permission"]] as Array<[string, string]>) : []),
             ["esc", "back"],
           ]}
         />
@@ -821,14 +1014,14 @@ function RunScreen(props: ScreenProps & { pane: () => Pane }) {
           </box>
         }
       >
-        {(run: RunState) => <RunView api={api} store={store} run={run} pane={props.pane} />}
+        {(run: RunState) => <RunView api={api} store={store} reqs={props.reqs} run={run} pane={props.pane} />}
       </Show>
     </box>
   )
 }
 
 function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
-  const { api, store, run } = props
+  const { api, store, reqs, run } = props
   const { t, tone, faint } = useTheme(api)
   const width = () => store.size().width
   const narrow = () => width() < 110
@@ -836,6 +1029,8 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
   const elapsed = () => (run.endedAt ? run.endedAt - run.startedAt : store.now() - run.startedAt)
   const live = () => isLive(run.status)
   const phasesW = () => (narrow() ? 26 : 32)
+  const waiting = () => reqs.waitingAgents(run)
+  const waitingIn = (p: PhaseState) => p.agentIds.some((id) => reqs.forAgent(run.agents[id]).length > 0)
 
   let phaseScroll: ScrollBoxRenderable | undefined
   let agentScroll: ScrollBoxRenderable | undefined
@@ -865,6 +1060,8 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
   const liveLine = () => {
     const a = liveAgent()
     if (!a) return undefined
+    const blocked = reqs.forAgent(a)[0]
+    if (blocked) return { label: a.label, text: `waiting for permission — ${describeRequest(blocked)}`, at: blocked.at, kind: "tool" as const, status: "waiting" }
     const f = a.liveFeed?.[a.liveFeed.length - 1]
     if (f) return { label: a.label, text: f.text, at: f.at, kind: f.kind, status: a.status }
     if (a.status === "running") return { label: a.label, text: "waiting for first output…", at: a.startedAt ?? 0, kind: "text" as const, status: a.status }
@@ -904,6 +1101,9 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
           <text style={{ fg: faint() }}>{`   billed ${fmtTokens(run.totalTokens)}`}</text>
           <text style={{ fg: t().textMuted }}>{`   ${fmtCost(run.totalCost)}`}</text>
           <text style={{ flexGrow: 1 }} />
+          <Show when={waiting().length > 0}>
+            <text style={{ fg: t().warning, attributes: BOLD }}>{`${waitingLabel(waiting().length)} — ! answers   `}</text>
+          </Show>
           <Show when={store.pendingControl(run.runId) === "resume"}>
             <text style={{ fg: t().warning }}>resume requested — waiting for the engine…</text>
           </Show>
@@ -941,8 +1141,9 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
                 const running = () => p.agentIds.some((id) => run.agents[id]?.status === "running")
                 const done = () => total() > 0 && p.done === total()
                 const failed = () => p.agentIds.some((id) => run.agents[id]?.status === "failed")
-                const glyph = () => (running() ? store.spinner() : done() ? (failed() ? "✗" : "✓") : total() ? "◔" : "○")
-                const gTone = (): Tone => (running() ? "accent" : done() ? (failed() ? "error" : "success") : "muted")
+                const blocked = () => waitingIn(p)
+                const glyph = () => (blocked() ? "⚠" : running() ? store.spinner() : done() ? (failed() ? "✗" : "✓") : total() ? "◔" : "○")
+                const gTone = (): Tone => (blocked() ? "warning" : running() ? "accent" : done() ? (failed() ? "error" : "success") : "muted")
                 const titleW = () => phasesW() - 2 - 2 - 3 - 8 - 1
                 return (
                   <box flexDirection="row" style={{ paddingLeft: 1, paddingRight: 1, height: 1, backgroundColor: isSel() ? t().backgroundElement : "transparent" }}>
@@ -983,8 +1184,8 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
                 return (
                   <Show when={a()}>
                     <box flexDirection="row" style={{ paddingLeft: 1, paddingRight: 1, height: 1, backgroundColor: isSel() ? t().backgroundElement : "transparent" }}>
-                      <Glyph api={api} store={store} status={() => a()!.status} width={A.icon} />
-                      <text style={{ fg: isSel() ? t().accent : t().text, width: labelW(), attributes: isSel() ? BOLD : 0 }}>{cell(a()!.label, labelW() - 1)}</text>
+                      <Glyph api={api} store={store} status={() => agentShownStatus(reqs, a())} width={A.icon} />
+                      <text style={{ fg: agentShownStatus(reqs, a()) === "waiting" ? t().warning : isSel() ? t().accent : t().text, width: labelW(), attributes: isSel() || agentShownStatus(reqs, a()) === "waiting" ? BOLD : 0 }}>{cell(a()!.label, labelW() - 1)}</text>
                       <Show when={!narrow()}>
                         <text style={{ fg: dim(), width: A.model }}>{cell(shortModel(a()!.model), A.model - 1)}</text>
                       </Show>
@@ -993,7 +1194,9 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
                         <text style={{ fg: faint(), width: A.billed }}>{cellR(fmtTok(a()!.tokens), A.billed)}</text>
                       </Show>
                       <text style={{ fg: dim(), width: A.tools }}>{cellR(a()!.toolCalls ? `${a()!.toolCalls} tool${a()!.toolCalls === 1 ? "" : "s"}` : "", A.tools)}</text>
-                      <text style={{ fg: a()!.status === "running" ? t().accent : dim(), width: A.time }}>{cellR(fmtElapsed(a()!.startedAt, a()!.endedAt, store.now()), A.time)}</text>
+                      <text style={{ fg: agentShownStatus(reqs, a()) === "waiting" ? t().warning : a()!.status === "running" ? t().accent : dim(), width: A.time }}>
+                        {cellR(agentShownStatus(reqs, a()) === "waiting" ? "waiting" : fmtElapsed(a()!.startedAt, a()!.endedAt, store.now()), A.time)}
+                      </text>
                     </box>
                   </Show>
                 )
@@ -1057,6 +1260,7 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
             ["x", "stop"],
             ["p", pauseLabel(store, run)],
             ["s", "save"],
+            ...(waiting().length ? ([["!", "answer permission"]] as Array<[string, string]>) : []),
             ["esc", "back"],
           ]}
         />
@@ -1084,18 +1288,20 @@ function AgentScreen(props: ScreenProps & { agentId: () => string; scrollRef: (e
           </box>
         }
       >
-        {(a: AgentState) => <AgentView api={api} store={store} run={store.activeRun()!} agent={a} scrollRef={props.scrollRef} />}
+        {(a: AgentState) => <AgentView api={api} store={store} reqs={props.reqs} run={store.activeRun()!} agent={a} scrollRef={props.scrollRef} />}
       </Show>
     </box>
   )
 }
 
 function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scrollRef: (el: ScrollBoxRenderable) => void }) {
-  const { api, store, run, agent: a } = props
+  const { api, store, reqs, run, agent: a } = props
   const { t, tone, faint } = useTheme(api)
   const width = () => store.size().width
   const bodyW = () => Math.max(30, width() - 8)
   const running = () => a.status === "running" || a.status === "queued"
+  const pending = () => reqs.forAgent(a)
+  const shown = () => agentShownStatus(reqs, a)
   const outcome = () => a.outcomeText ?? (typeof a.outcome === "string" ? a.outcome : a.outcome ? JSON.stringify(a.outcome, null, 2) : "")
   const age = (at: number) => fmtDuration(Math.max(0, store.now() - at))
   const phaseIds = () => run.phases.find((p) => p.title === a.phase)?.agentIds ?? run.agentOrder
@@ -1109,9 +1315,9 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
       {/* header */}
       <box
         flexDirection="column"
-        style={{ border: true, borderStyle: "rounded", borderColor: t().border, paddingLeft: 1, paddingRight: 1, height: 4 }}
-        title={` ${statusGlyph(a.status, store.spinner())} ${clip(a.label, 48)} `}
-        titleColor={tone(statusTone(a.status))}
+        style={{ border: true, borderStyle: "rounded", borderColor: pending().length ? t().warning : t().border, paddingLeft: 1, paddingRight: 1, height: 4 }}
+        title={` ${statusGlyph(shown(), store.spinner())} ${clip(a.label, 48)} `}
+        titleColor={tone(statusTone(shown()))}
       >
         <box flexDirection="row" style={{ height: 1 }}>
           <text style={{ fg: t().textMuted }}>phase </text>
@@ -1119,7 +1325,7 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
           <text style={{ fg: t().textMuted }}>{`  ·  agent ${pos()}  ·  model `}</text>
           <text style={{ fg: t().text }}>{clip(a.model || "default", 40)}</text>
           <text style={{ flexGrow: 1 }} />
-          <text style={{ fg: tone(statusTone(a.status)), attributes: BOLD }}>{statusLabel(a.status).toUpperCase()}</text>
+          <text style={{ fg: tone(statusTone(shown())), attributes: BOLD }}>{shown() === "waiting" ? "NEEDS PERMISSION" : statusLabel(a.status).toUpperCase()}</text>
         </box>
         <box flexDirection="row" style={{ height: 1 }}>
           <text style={{ fg: t().textMuted }}>context </text>
@@ -1137,6 +1343,28 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
       {/* body */}
       <box flexDirection="column" style={{ height: bodyH(), border: true, borderStyle: "rounded", borderColor: t().border, marginTop: 1, overflow: "hidden" }}>
         <scrollbox ref={props.scrollRef} style={{ flexGrow: 1, paddingLeft: 1, paddingRight: 1 }} scrollY={true} scrollX={false}>
+          {/* blocked on a permission / question — the agent cannot continue until answered */}
+          <Show when={pending().length > 0}>
+            <box flexDirection="row" style={{ paddingTop: 1 }}>
+              <text style={{ fg: t().warning, attributes: BOLD }}>{`⚠ Waiting for your answer · ${pending().length}`}</text>
+              <text style={{ fg: t().textMuted }}>{"  ⏎ opens the dialog"}</text>
+            </box>
+            <For each={pending()}>
+              {(p) => (
+                <box flexDirection="column">
+                  <box flexDirection="row" style={{ height: 1 }}>
+                    <text style={{ fg: t().textMuted, width: 8 }}>{cellR(age(p.at), 7)}</text>
+                    <text style={{ fg: t().warning, width: 2 }}>{p.kind === "permission" ? "⚿" : "?"}</text>
+                    <text style={{ fg: t().text }}>{clip(describeRequest(p), bodyW() - 12)}</text>
+                  </box>
+                  <Show when={p.kind === "permission" && typeof (p as any).req.metadata?.description === "string"}>
+                    <text style={{ fg: t().textMuted, attributes: DIM }}>{`          ${clip(String((p as any).req.metadata.description), bodyW() - 12)}`}</text>
+                  </Show>
+                </box>
+              )}
+            </For>
+          </Show>
+
           <Show when={a.error}>
             <SectionTitle api={api} title="Error" />
             <TextBlock api={api} text={() => a.error ?? ""} width={bodyW} fg={() => t().error} />
@@ -1144,7 +1372,7 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
 
           {/* live feed while running */}
           <Show when={running()}>
-            <SectionTitle api={api} title={`${store.spinner()} Live`} hint={() => "newest first"} />
+            <SectionTitle api={api} title={pending().length ? "⚠ Live" : `${store.spinner()} Live`} hint={() => (pending().length ? "blocked until the request above is answered" : "newest first")} />
             <Show when={feed().length === 0}>
               <text style={{ fg: t().textMuted }}>waiting for first output…</text>
             </Show>
@@ -1205,6 +1433,7 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
         <Hints
           api={api}
           items={[
+            ...(pending().length ? ([["⏎", pending()[0]?.kind === "question" ? "answer question" : "allow / reject"]] as Array<[string, string]>) : []),
             ["↑↓", "scroll"],
             ["←→", "prev/next agent"],
             ["e", store.expandActivity() ? "hide previews" : "show previews"],
