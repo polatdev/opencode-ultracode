@@ -1,6 +1,10 @@
 // Shared types between the server plugin (engine) and the TUI plugin (views).
 // The state file written by the server is the single source of truth the TUI polls.
 
+import { createHash } from "node:crypto"
+import { tmpdir } from "node:os"
+import { basename } from "node:path"
+
 export type RunStatus =
   | "pending"
   | "running"
@@ -32,6 +36,8 @@ export interface PhaseState extends PhaseDef {
 }
 
 export interface AgentActivity {
+  /** host tool-call id (when the host sends one) — used to match updates */
+  callId?: string
   /** tool name, e.g. "StructuredOutput" or "bash" */
   tool: string
   /** short title / first words of the call */
@@ -52,8 +58,18 @@ export interface AgentState {
   status: AgentStatus
   /** resolved model, e.g. "anthropic/claude-sonnet-4" or "qwen3.8" */
   model: string
-  /** tokens used so far (input+output+reasoning+cache reads) */
+  /**
+   * BILLED tokens: sum over every API call this agent made of
+   * input+output+reasoning+cache read/write. Each call re-sends the whole
+   * context, so this grows quadratically with tool-call count and is much
+   * larger than the context size. Matches `cost`.
+   */
   tokens: number
+  /**
+   * CONTEXT size: prompt tokens (input + cache read/write) of the LATEST API
+   * call, i.e. how big the agent's context actually is right now.
+   */
+  contextTokens: number
   outputTokens: number
   cost: number
   toolCalls: number
@@ -64,10 +80,14 @@ export interface AgentState {
   outcomeText?: string
   /** latest LLM text chunk seen while the agent is running (live view) */
   liveText?: string
+  /** recent live activity (text chunks + tool calls), newest last, capped */
+  liveFeed?: { at: number; kind: "text" | "tool"; text: string }[]
   startedAt?: number
   endedAt?: number
   error?: string
   sessionId?: string
+  /** true when this agent's result was replayed from a previous run of the same runId (resume) */
+  replayed?: boolean
 }
 
 export interface RunLogEntry {
@@ -95,8 +115,10 @@ export interface RunState {
   agentDone: number
   startedAt: number
   endedAt?: number
-  /** total tokens across all agents */
+  /** total BILLED tokens across all agents (see AgentState.tokens) */
   totalTokens: number
+  /** sum of every agent's current context size (see AgentState.contextTokens) */
+  totalContextTokens: number
   totalCost: number
   /** resolved script path (for save) */
   scriptPath?: string
@@ -106,27 +128,60 @@ export interface RunState {
   error?: string
   /** the directory this run was created in */
   directory: string
+  /** opencode session that started the run; the result turn is delivered here (also after a resume) */
+  mainSessionID?: string
+  /** model the starting session used; agents without an explicit model inherit it (needed to resume) */
+  defaultModel?: string
+  /** the script's `args` value, kept so a resume re-runs the script with the same input */
+  args?: unknown
+  /** set when the run was resumed after its engine died (opencode exit/crash) */
+  resumedAt?: number
+  /** how many times the run has been resumed */
+  resumeCount?: number
 }
 
+/**
+ * control.json written by the TUI. A live engine polls it for pause/resume/stop.
+ * `resume` on a run with no live engine (opencode exited while it ran) asks the
+ * server plugin to restart the run: completed agents replay from the journal,
+ * the rest run again.
+ */
 export interface ControlState {
+  action?: "pause" | "resume" | "stop"
   pause?: boolean
+  resume?: boolean
   stop?: boolean
+  at?: number
 }
 
 // --- wire helpers -----------------------------------------------------------
 
-export function runDir(workflowDir: string, runId: string): string {
-  return `${workflowDir}/runs/${runId}`
+/**
+ * Where run artifacts (state.json, journal.jsonl, script.js, control.json) live:
+ * /tmp/opencode-workflows/<project-name>-<hash6>. Runs are scratch data, so they
+ * stay out of the project tree; the hash suffix keeps two projects with the same
+ * folder name (e.g. two "api" checkouts) from sharing a run list.
+ * Saved workflows (<name>.js) are project assets and stay under workflowRoot().
+ */
+export function runsRoot(worktree: string): string {
+  const base = process.platform === "win32" ? tmpdir() : "/tmp"
+  const name = (basename(worktree) || "project").replace(/[^a-zA-Z0-9._-]/g, "-")
+  const hash = createHash("sha1").update(worktree).digest("hex").slice(0, 6)
+  return `${base}/opencode-workflows/${name}-${hash}`
 }
-export function statePath(workflowDir: string, runId: string): string {
-  return `${runDir(workflowDir, runId)}/state.json`
+export function runDir(runsRootDir: string, runId: string): string {
+  return `${runsRootDir}/${runId}`
 }
-export function controlPath(workflowDir: string, runId: string): string {
-  return `${runDir(workflowDir, runId)}/control.json`
+export function statePath(runsRootDir: string, runId: string): string {
+  return `${runDir(runsRootDir, runId)}/state.json`
 }
-export function journalPath(workflowDir: string, runId: string): string {
-  return `${runDir(workflowDir, runId)}/journal.jsonl`
+export function controlPath(runsRootDir: string, runId: string): string {
+  return `${runDir(runsRootDir, runId)}/control.json`
 }
+export function journalPath(runsRootDir: string, runId: string): string {
+  return `${runDir(runsRootDir, runId)}/journal.jsonl`
+}
+/** saved (named) workflow scripts: <worktree>/.opencode/workflows/<name>.js */
 export function workflowRoot(worktree: string): string {
   return `${worktree}/.opencode/workflows`
 }

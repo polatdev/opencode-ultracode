@@ -1,8 +1,9 @@
 // Workflow engine: runs a parsed workflow script against the opencode SDK.
 // Deterministic-ish sandbox (see script.ts), concurrency pool, live state
-// writing to .opencode/workflows/runs/<runId>/state.json, pause/stop control.
+// writing to /tmp/opencode-workflows/<project>/<runId>/state.json, pause/stop control.
 
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync, existsSync, rmSync } from "node:fs"
+import { createHash } from "node:crypto"
 import { cpus } from "node:os"
 import { join } from "node:path"
 import {
@@ -28,8 +29,10 @@ export interface EngineClient {
 
 export interface EngineDeps {
   client: EngineClient
-  /** absolute path to the .opencode dir (runs live in <dir>/workflows/runs) */
+  /** absolute path to the project's .opencode dir (saved workflows live in <dir>/workflows) */
   opencodeDir: string
+  /** absolute directory that holds one folder per run (see runsRoot() in shared/state.ts) */
+  runsRoot: string
   mainSessionID: string
   defaultModel?: string
   availableModels: Set<string>
@@ -45,6 +48,82 @@ export interface RunOptions {
   name?: string
   args?: any
   budgetTotal?: number | null
+  /**
+   * Resume a run whose engine died (opencode exited/crashed, or it was stopped).
+   * The engine must be constructed with the SAME runId. The prior script is
+   * re-executed; every agent() whose (phase, label, prompt) matches a completed
+   * agent of the prior run returns that agent's journaled result instantly and
+   * is marked `replayed`. Everything else runs for real.
+   */
+  resume?: PriorRun
+}
+
+/** what loadPriorRun() recovers from a run folder for a resume */
+export interface PriorRun {
+  state: RunState
+  script: string
+  /** replay key (see replayKey) -> journaled results + agent snapshots, in spawn order */
+  replay: Map<string, Array<{ result: any; agent: AgentState }>>
+  /** completed agents that can be replayed */
+  replayable: number
+}
+
+/** agents are matched across runs by where they ran and what they were asked */
+function replayKey(phase: string, label: string, prompt: string): string {
+  return `${phase}\u0000${label}\u0000${createHash("sha1").update(prompt).digest("hex")}`
+}
+
+/**
+ * Read a finished/stopped run's folder so it can be resumed in place. Returns
+ * undefined when the folder has no usable state or script. Results come from
+ * journal.jsonl (`agent-done` entries carry the full value); the state file
+ * supplies prompts and token/cost snapshots. A result that was truncated in
+ * the journal is not replayable, so that agent simply runs again.
+ */
+export function loadPriorRun(runsRootDir: string, runId: string): PriorRun | undefined {
+  let state: RunState
+  let script: string
+  try {
+    state = JSON.parse(readFileSync(statePath(runsRootDir, runId), "utf8"))
+    script = readFileSync(join(runDir(runsRootDir, runId), "script.js"), "utf8")
+  } catch {
+    return undefined
+  }
+  if (!state || typeof state !== "object" || !state.agents || !script) return undefined
+  const results = new Map<string, any>()
+  try {
+    for (const line of readFileSync(journalPath(runsRootDir, runId), "utf8").split("\n")) {
+      if (!line) continue
+      let e: any
+      try {
+        e = JSON.parse(line)
+      } catch {
+        continue
+      }
+      if (e?.type !== "agent-done" || e.status !== "completed" || typeof e.result !== "string") continue
+      try {
+        results.set(e.id, JSON.parse(e.result))
+      } catch {
+        // truncated or otherwise unparsable → not replayable
+      }
+    }
+  } catch {}
+  const replay = new Map<string, Array<{ result: any; agent: AgentState }>>()
+  let replayable = 0
+  for (const id of state.agentOrder ?? Object.keys(state.agents)) {
+    const a = state.agents[id]
+    if (!a || a.status !== "completed") continue
+    let result: any
+    if (results.has(id)) result = results.get(id)
+    else if (a.outcome !== undefined) result = a.outcome
+    else continue
+    const key = replayKey(a.phase, a.label, a.prompt ?? "")
+    const list = replay.get(key) ?? []
+    list.push({ result, agent: a })
+    replay.set(key, list)
+    replayable++
+  }
+  return { state, script, replay, replayable }
 }
 
 export class RunAbortedError extends Error {
@@ -75,11 +154,13 @@ export class RunEngine {
   private controlTimer: any = null
   private agentSeq = 0
   private sessionToAgent = new Map<string, string>()
-  private sessionMsgTotals = new Map<string, Map<string, { t: number; o: number; c: number }>>()
+  private sessionMsgTotals = new Map<string, Map<string, { t: number; o: number; c: number; ctx: number }>>()
+  private lastTextPart = new Map<string, string>()
   private sem = 0
   private semMax: number
   private waiters: Array<() => void> = []
   private stoppedAgents = new Set<string>()
+  private replay: Map<string, Array<{ result: any; agent: AgentState }>> | undefined
   private startedAt: number
   private resolveModelLabel: (m: ModelRef) => string
 
@@ -94,7 +175,7 @@ export class RunEngine {
   }
 
   get runDir() {
-    return runDir(join(this.deps.opencodeDir, "workflows"), this.runId)
+    return runDir(this.deps.runsRoot, this.runId)
   }
 
   registerSession(agentId: string, sessionId: string) {
@@ -118,22 +199,38 @@ export class RunEngine {
     const a = this.state.agents[agentId]
     if (!a) return
     const tk = tokenTotal(msg.tokens)
-    const entry = { t: Math.max(0, tk | 0), o: Math.max(0, Number(msg.tokens?.output ?? 0) | 0), c: typeof msg.cost === "number" ? msg.cost : 0 }
-    const per = this.sessionMsgTotals.get(msg.sessionID) ?? new Map<string, { t: number; o: number; c: number }>()
+    const entry = {
+      t: Math.max(0, tk | 0),
+      o: Math.max(0, Number(msg.tokens?.output ?? 0) | 0),
+      c: typeof msg.cost === "number" ? msg.cost : 0,
+      ctx: Math.max(0, contextTokens(msg.tokens) | 0),
+    }
+    const per = this.sessionMsgTotals.get(msg.sessionID) ?? new Map<string, { t: number; o: number; c: number; ctx: number }>()
     const prev = per.get(msg.id)
-    if (prev && prev.t === entry.t && prev.o === entry.o && prev.c === entry.c) return
+    if (prev && prev.t === entry.t && prev.o === entry.o && prev.c === entry.c && prev.ctx === entry.ctx) return
     per.set(msg.id, entry)
     this.sessionMsgTotals.set(msg.sessionID, per)
+    // billed = sum over all calls; context = prompt size of the latest call
+    // (message ids are time-ordered, so the greatest id is the newest call;
+    // a still-streaming message may report 0 until the provider fills it in,
+    // so keep the previous non-zero context in that case)
     let T = 0
     let O = 0
     let C = 0
-    for (const e of per.values()) {
+    let newestId = ""
+    let ctx = 0
+    for (const [id, e] of per) {
       T += e.t
       O += e.o
       C += e.c
+      if (id > newestId && e.ctx > 0) {
+        newestId = id
+        ctx = e.ctx
+      }
     }
     a.tokens = T
     a.outputTokens = O
+    a.contextTokens = ctx
     a.cost = C
     this.recount()
     this.markDirty()
@@ -148,36 +245,72 @@ export class RunEngine {
       const txt = typeof part?.text === "string" ? part.text : ""
       if (!txt.trim()) return
       a.liveText = txt.slice(-800)
+      const pid = typeof part?.id === "string" ? part.id : ""
+      if (pid !== this.lastTextPart.get(agentId)) {
+        this.lastTextPart.set(agentId, pid)
+        this.pushLiveFeed(a, "text", txt)
+      } else {
+        // same part still streaming: refresh the newest feed line in place
+        const f = a.liveFeed?.[a.liveFeed.length - 1]
+        if (f && f.kind === "text") f.text = txt.trim().replace(/\s+/g, " ").slice(0, 160)
+      }
       this.markDirty()
       return
     }
     if (part?.type !== "tool") return
     const st = part.state
-    // a new tool part (or its status flip) counts as one tool call
-    const existing = a.activity.find((x) => x.tool === part.tool && !x.endedAt)
+    const callId = typeof part?.callID === "string" ? part.callID : typeof part?.id === "string" ? part.id : undefined
+    // match the open activity entry by call id first; fall back to "latest
+    // open entry of the same tool" for hosts that do not send ids
+    const existing =
+      (callId && a.activity.find((x) => x.callId === callId)) ||
+      a.activity.find((x) => !x.callId && x.tool === part.tool && !x.endedAt)
+    const title = toolTitle(part.tool, st)
     if (!existing) {
       a.activity.push({
+        callId,
         tool: part.tool,
-        title: st?.title ?? st?.output?.slice?.(0, 80) ?? String(part.tool),
+        title,
         preview: undefined,
         startedAt: Date.now(),
       })
       a.toolCalls = a.activity.length
+      this.pushLiveFeed(a, "tool", `${part.tool} ${title !== part.tool ? title : ""}`)
       this.recount()
       this.markDirty()
       return
     }
-    if (st?.status === "completed" || st?.status === "error") {
+    if (existing.title === existing.tool && title !== part.tool) existing.title = title
+    if (!existing.endedAt && (st?.status === "completed" || st?.status === "error")) {
       existing.endedAt = Date.now()
       existing.preview = truncate(String(st?.output ?? st?.error ?? ""), 300)
+      const tail = st?.status === "error" ? `failed · ${oneLine(String(st?.error ?? ""))}` : "done"
+      this.pushLiveFeed(a, "tool", `${existing.tool} ${tail} · ${existing.title !== existing.tool ? existing.title : ""}`)
+      this.markDirty()
+    } else {
       this.markDirty()
     }
+  }
+
+  private pushLiveFeed(a: AgentState, kind: "text" | "tool", text: string): void {
+    const line = String(text ?? "").trim().replace(/\s+/g, " ").slice(0, 160)
+    if (!line) return
+    const feed = a.liveFeed ?? (a.liveFeed = [])
+    feed.push({ at: Date.now(), kind, text: line })
+    while (feed.length > 10) feed.shift()
   }
 
   // --- run lifecycle -------------------------------------------------------
 
   async run(opts: RunOptions): Promise<{ runId: string; status: RunStatus; name: string; error?: string; result?: string }> {
     mkdirSync(this.runDir, { recursive: true })
+    const prior = opts.resume
+    if (prior) {
+      if (prior.state.runId !== this.runId) throw new Error(`resume: engine runId ${this.runId} does not match prior run ${prior.state.runId}`)
+      opts = { ...opts, script: prior.script, scriptPath: undefined, name: undefined, args: opts.args ?? prior.state.args }
+      this.replay = prior.replay
+      this.startedAt = prior.state.startedAt || this.startedAt
+    }
     const parsed = this.resolveScript(opts)
     const meta = parsed.meta
     const total = countAgents(meta)
@@ -196,11 +329,25 @@ export class RunEngine {
       agentDone: 0,
       startedAt: this.startedAt,
       totalTokens: 0,
+      totalContextTokens: 0,
       totalCost: 0,
       scriptPath: opts.scriptPath ?? (opts.name ? this.findSavedScript(opts.name) : undefined),
       directory: join(this.deps.opencodeDir, ".."),
+      mainSessionID: this.deps.mainSessionID || undefined,
+      defaultModel: this.deps.defaultModel,
+      args: opts.args,
     }
-    this.writeJournal({ type: "run-start", runId: this.runId, name: meta.name, agentEstimate: total, at: this.startedAt })
+    if (prior) {
+      // keep the story of the run: earlier logs, then a marker for this resume
+      this.state.logs = (prior.state.logs ?? []).slice(-150)
+      this.state.scriptPath = prior.state.scriptPath
+      this.state.resumedAt = Date.now()
+      this.state.resumeCount = (prior.state.resumeCount ?? 0) + 1
+      this.logLine("log", `resumed (${prior.replayable} completed agent${prior.replayable === 1 ? "" : "s"} replay from the journal, the rest run again)`)
+      this.writeJournal({ type: "run-start", runId: this.runId, name: meta.name, agentEstimate: total, at: Date.now(), resumed: true, replayable: prior.replayable })
+    } else {
+      this.writeJournal({ type: "run-start", runId: this.runId, name: meta.name, agentEstimate: total, at: this.startedAt })
+    }
     this.flushNow()
 
     this.heartbeat = setInterval(() => this.markDirty(), 2000)
@@ -240,6 +387,7 @@ export class RunEngine {
       runId: this.runId,
       agents: this.state.agentCount,
       tokens: this.state.totalTokens,
+      contextTokens: this.state.totalContextTokens,
       error: rawError ? String(rawError) : undefined,
     })
   }
@@ -343,6 +491,7 @@ export class RunEngine {
       status: "queued",
       model: model ? this.resolveModelLabel(model) : this.deps.defaultModel ?? "default",
       tokens: 0,
+      contextTokens: 0,
       outputTokens: 0,
       cost: 0,
       toolCalls: 0,
@@ -357,6 +506,28 @@ export class RunEngine {
     this.recount()
     this.markDirty()
     this.writeJournal({ type: "agent-start", id, label, phase: phaseTitle, at: Date.now() })
+
+    const hit = this.takeReplay(phaseTitle, label, agent.prompt)
+    if (hit) {
+      const p = hit.agent
+      agent.status = "completed"
+      agent.replayed = true
+      agent.model = p.model || agent.model
+      agent.tokens = p.tokens || 0
+      agent.contextTokens = p.contextTokens || 0
+      agent.outputTokens = p.outputTokens || 0
+      agent.cost = p.cost || 0
+      agent.toolCalls = p.toolCalls || 0
+      agent.activity = Array.isArray(p.activity) ? p.activity : []
+      agent.outcome = p.outcome
+      agent.outcomeText = p.outcomeText ?? truncate(typeof hit.result === "string" ? hit.result : JSON.stringify(hit.result, null, 2), 4000)
+      agent.sessionId = p.sessionId
+      agent.startedAt = p.startedAt
+      agent.endedAt = p.endedAt ?? Date.now()
+      this.onAgentTerminal(agent)
+      this.writeJournal({ type: "agent-done", id, status: "completed", replayed: true, result: truncate(JSON.stringify(hit.result ?? null), 100_000), at: Date.now() })
+      return hit.result
+    }
 
     await this.acquireSem()
     try {
@@ -458,6 +629,14 @@ export class RunEngine {
     return value
   }
 
+  /** pop the next journaled result for this (phase, label, prompt), if resuming */
+  private takeReplay(phase: string, label: string, prompt: string): { result: any; agent: AgentState } | undefined {
+    if (!this.replay) return undefined
+    const list = this.replay.get(replayKey(phase, label, prompt))
+    if (!list?.length) return undefined
+    return list.shift()
+  }
+
   private onAgentTerminal(_agent: AgentState): void {
     this.recount()
     this.markDirty()
@@ -520,7 +699,7 @@ export class RunEngine {
   // --- control (pause / stop) -------------------------------------------------
 
   private pollControl(): void {
-    const p = controlPath(join(this.deps.opencodeDir, "workflows"), this.runId)
+    const p = controlPath(this.deps.runsRoot, this.runId)
     let raw: string | undefined
     try {
       raw = readFileSync(p, "utf8")
@@ -615,6 +794,7 @@ export class RunEngine {
     this.state.agentCount = agents.length
     this.state.agentDone = agents.filter((a) => a.status !== "queued" && a.status !== "running").length
     this.state.totalTokens = agents.reduce((s, a) => s + (a.tokens || 0), 0)
+    this.state.totalContextTokens = agents.reduce((s, a) => s + (a.contextTokens || 0), 0)
     this.state.totalCost = agents.reduce((s, a) => s + (a.cost || 0), 0)
   }
 
@@ -632,7 +812,7 @@ export class RunEngine {
     if (!this.state) return
     try {
       mkdirSync(this.runDir, { recursive: true })
-      writeFileSync(statePath(join(this.deps.opencodeDir, "workflows"), this.runId), JSON.stringify(this.state, null, 2))
+      writeFileSync(statePath(this.deps.runsRoot, this.runId), JSON.stringify(this.state, null, 2))
     } catch (e: any) {
       this.deps.log?.("error", `workflow state write failed: ${errText(e)}`)
     }
@@ -641,7 +821,7 @@ export class RunEngine {
   private writeJournal(entry: any): void {
     try {
       mkdirSync(this.runDir, { recursive: true })
-      appendFileSync(journalPath(join(this.deps.opencodeDir, "workflows"), this.runId), JSON.stringify(entry) + "\n")
+      appendFileSync(journalPath(this.deps.runsRoot, this.runId), JSON.stringify(entry) + "\n")
     } catch {}
   }
 
@@ -677,6 +857,29 @@ export class RunEngine {
     return undefined
   }
 
+  /** host is shutting down: mark the run stopped so the TUI never shows a zombie "running" */
+  shutdown(reason: string): void {
+    if (!this.state) return
+    if (this.state.status === "completed" || this.state.status === "failed" || this.state.status === "stopped") return
+    this.stopRequested = true
+    this.abortAll()
+    for (const a of Object.values(this.state.agents)) {
+      if (a.status === "running" || a.status === "queued") {
+        a.status = "cancelled"
+        a.error = reason
+        a.endedAt = Date.now()
+      }
+    }
+    this.recount()
+    this.state.status = "stopped"
+    this.state.endedAt = Date.now()
+    this.state.error = this.state.error ?? reason
+    this.logLine("stopped", reason)
+    this.writeJournal({ type: "run-end", runId: this.runId, status: "stopped", at: Date.now(), reason })
+    this.cleanupTimers()
+    this.flushNow()
+  }
+
   private cleanupTimers(): void {
     if (this.heartbeat) clearInterval(this.heartbeat)
     if (this.controlTimer) clearInterval(this.controlTimer)
@@ -689,6 +892,12 @@ export class RunEngine {
 function tokenTotal(t: any): number {
   if (!t) return 0
   return (t.input ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0)
+}
+
+/** prompt size of one API call: everything the model read, minus what it wrote */
+function contextTokens(t: any): number {
+  if (!t) return 0
+  return (t.input ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0)
 }
 
 function finalText(parts: any[]): string {
@@ -740,3 +949,22 @@ function safeName(n: string): string {
 }
 
 export type { Primitives }
+
+/** human title for a tool call: host title → recognisable input field → tool name */
+function toolTitle(tool: string, st: any): string {
+  const t = typeof st?.title === "string" ? st.title.trim() : ""
+  if (t) return oneLine(t).slice(0, 120)
+  const input = st?.input
+  if (input && typeof input === "object") {
+    for (const k of ["command", "filePath", "path", "pattern", "query", "url", "description", "prompt", "title"]) {
+      const v = (input as any)[k]
+      if (typeof v === "string" && v.trim()) return oneLine(v).slice(0, 120)
+    }
+    for (const v of Object.values(input)) if (typeof v === "string" && v.trim()) return oneLine(v).slice(0, 120)
+  }
+  return String(tool)
+}
+
+function oneLine(s: string): string {
+  return s.replace(/\s+/g, " ").trim()
+}

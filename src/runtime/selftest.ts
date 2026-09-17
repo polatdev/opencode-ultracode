@@ -5,13 +5,15 @@ import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import assert from "node:assert"
-import { generateRunId, RunEngine } from "./engine.ts"
+import { generateRunId, loadPriorRun, RunEngine } from "./engine.ts"
 import { parseScript } from "./script.ts"
 
 const tmp = mkdtempSync(join(tmpdir(), "wf-selftest-"))
 const opencodeDir = join(tmp, ".opencode")
+const runsRoot = join(tmp, "runs")
 
 let sessionSeq = 0
+let promptCount = 0
 const seenSessions: string[] = []
 
 const fakeClient = {
@@ -23,6 +25,7 @@ const fakeClient = {
       return { id, parentID: args.body?.parentID }
     },
     async prompt(args: any) {
+      promptCount++
       const id = args.path.id
       const text = String(args.body?.parts?.[0]?.text ?? "")
       console.log(`  [mock] session.prompt  ${id} model=${args.body?.model ? JSON.stringify(args.body.model) : "(inherit)"} chars=${text.length}`)
@@ -133,7 +136,7 @@ async function main() {
   console.log("test 2: full demo-fanout run (4 agents)")
   const runId = generateRunId()
   const engine = new RunEngine(
-    { client: fakeClient as any, opencodeDir, mainSessionID: "ses_main", defaultModel: "mock/sonnet", availableModels: new Set(["mock/sonnet", "mock/haiku"]), runArgs: { extra: 1 } },
+    { client: fakeClient as any, opencodeDir, runsRoot, mainSessionID: "ses_main", defaultModel: "mock/sonnet", availableModels: new Set(["mock/sonnet", "mock/haiku"]), runArgs: { extra: 1 } },
     runId,
   )
   const t0 = Date.now()
@@ -147,7 +150,7 @@ async function main() {
   assert.ok(result.final?.report?.best?.length <= 3, "expected synthesized report")
 
   // state file
-  const state = JSON.parse(readFileSync(join(opencodeDir, "workflows", "runs", runId, "state.json"), "utf8"))
+  const state = JSON.parse(readFileSync(join(runsRoot, runId, "state.json"), "utf8"))
   assert.equal(state.status, "completed")
   assert.equal(state.agentCount, 4)
   assert.equal(state.agentDone, 4)
@@ -160,12 +163,20 @@ async function main() {
   const synth = state.agents[state.agentOrder[3]]
   assert.equal(synth.model, "mock/sonnet", "agent should inherit session model")
   assert.ok(synth.tokens > 0, "tokens tracked")
+  // mock message: input 10k + cache read 20k + cache write 500 = 30.5k context per call
+  assert.equal(synth.contextTokens, 30_500, "context = prompt size of the latest call")
+  assert.ok(synth.tokens >= synth.contextTokens + 3_600, "billed includes output on top of context")
   assert.ok(synth.outcome, "outcome stored")
   assert.ok(state.totalTokens > 0)
-  console.log(`  ok: state.json (4 agents, 2 phases, tokens=${state.totalTokens})`)
+  assert.equal(
+    state.totalContextTokens,
+    state.agentOrder.reduce((n: number, id: string) => n + state.agents[id].contextTokens, 0),
+    "run context = sum of agent contexts",
+  )
+  console.log(`  ok: state.json (4 agents, 2 phases, billed=${state.totalTokens}, context=${state.totalContextTokens})`)
 
   // journal
-  const journal = readFileSync(join(opencodeDir, "workflows", "runs", runId, "journal.jsonl"), "utf8").trim().split("\n")
+  const journal = readFileSync(join(runsRoot, runId, "journal.jsonl"), "utf8").trim().split("\n")
   assert.ok(journal.length >= 9, `journal lines = ${journal.length}`)
   const kinds = journal.map((l) => JSON.parse(l).type)
   assert.ok(kinds.includes("run-start") && kinds.includes("run-end"))
@@ -174,7 +185,7 @@ async function main() {
   console.log("  ok: journal (run-start, 4x agent-start/done, run-end)")
 
   // script.js persisted
-  assert.ok(existsSync(join(opencodeDir, "workflows", "runs", runId, "script.js")), "script.js persisted")
+  assert.ok(existsSync(join(runsRoot, runId, "script.js")), "script.js persisted")
   console.log("  ok: script.js persisted")
 
   // ---- test 3: deterministic sandbox ---------------------------------------
@@ -190,10 +201,10 @@ await agent("say hi", { label: "t3a" })
 return "done"
 `
   const rid3 = generateRunId()
-  const e3 = new RunEngine({ client: fakeClient as any, opencodeDir, mainSessionID: "ses_main", availableModels: new Set() }, rid3)
+  const e3 = new RunEngine({ client: fakeClient as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set() }, rid3)
   const r3 = await e3.run({ script: S1 })
   assert.equal(r3.status, "completed")
-  const s3 = JSON.parse(readFileSync(join(opencodeDir, "workflows", "runs", rid3, "state.json"), "utf8"))
+  const s3 = JSON.parse(readFileSync(join(runsRoot, rid3, "state.json"), "utf8"))
   const logs = s3.logs.map((l: any) => l.message).join(" | ")
   console.log(`  logs: ${logs}`)
   assert.ok(logs.includes("date-now-blocked:true"))
@@ -210,10 +221,10 @@ log("date-ok:" + (new Date(1700000000000).getTime() === 1700000000000))
 return 42
 `
   const rid3b = generateRunId()
-  const e3b = new RunEngine({ client: fakeClient as any, opencodeDir, mainSessionID: "ses_main", availableModels: new Set() }, rid3b)
+  const e3b = new RunEngine({ client: fakeClient as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set() }, rid3b)
   const r3b = await e3b.run({ script: S2 })
   assert.equal(r3b.status, "completed")
-  const s3b = JSON.parse(readFileSync(join(opencodeDir, "workflows", "runs", rid3b, "state.json"), "utf8"))
+  const s3b = JSON.parse(readFileSync(join(runsRoot, rid3b, "state.json"), "utf8"))
   assert.ok(s3b.logs.some((l: any) => l.message === "date-ok:true"))
   assert.equal(r3b.result, "42")
   console.log("  ok: new Date(ts) + return values work")
@@ -234,10 +245,10 @@ log("parallel-nulls:" + bad.filter(Boolean).length + "/" + bad.length)
 return out
 `
   const rid4 = generateRunId()
-  const e4 = new RunEngine({ client: fakeClient as any, opencodeDir, mainSessionID: "ses_main", availableModels: new Set() }, rid4)
+  const e4 = new RunEngine({ client: fakeClient as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set() }, rid4)
   const r4 = await e4.run({ script: S4 })
   assert.equal(r4.status, "completed")
-  const s4 = JSON.parse(readFileSync(join(opencodeDir, "workflows", "runs", rid4, "state.json"), "utf8"))
+  const s4 = JSON.parse(readFileSync(join(runsRoot, rid4, "state.json"), "utf8"))
   const l4 = s4.logs.map((l: any) => l.message).join(" | ")
   console.log(`  logs: ${l4}`)
   const pm = l4.match(/pipeline:(.*) \| parallel-nulls/)
@@ -253,7 +264,55 @@ return out
   assert.equal(failed.length, 0, "pipeline stage throw should drop item, not fail agent (agent itself succeeded)")
   console.log("  ok: pipeline stages, item drop on stage error, parallel null on reject")
 
-  console.log(`\nALL TESTS PASSED (${Date.now() - t0}ms total, tmp=${tmp})`)
+    // ---- test 5: resume after the engine died ----------------------------------
+  console.log("test 5: resume a stopped run (completed agents replay from the journal)")
+  {
+    const rid = generateRunId()
+    const deps = { client: fakeClient as any, opencodeDir, runsRoot, mainSessionID: "ses_main", defaultModel: "mock/sonnet", availableModels: new Set(["mock/sonnet"]) }
+    const e1 = new RunEngine(deps, rid)
+    // make the synthesis agent die mid-run: stop the run once the Generate phase is done
+    const origPrompt = fakeClient.session.prompt
+    let calls = 0
+    fakeClient.session.prompt = async (args: any) => {
+      calls++
+      if (calls === 4) {
+        e1.shutdown("opencode exited while the workflow was running")
+        throw new Error("connection closed")
+      }
+      return origPrompt(args)
+    }
+    const r1 = await e1.run({ script: DEMO, args: { extra: 7 } })
+    fakeClient.session.prompt = origPrompt
+    assert.equal(r1.status, "stopped", `expected stopped, got ${r1.status} (${r1.error})`)
+    const s1: any = JSON.parse(readFileSync(join(runsRoot, rid, "state.json"), "utf8"))
+    assert.equal(s1.mainSessionID, "ses_main")
+    assert.deepEqual(s1.args, { extra: 7 })
+    const done1 = Object.values(s1.agents).filter((a: any) => a.status === "completed").length
+    assert.equal(done1, 3, `3 tip agents should have completed before the stop (got ${done1})`)
+
+    const prior = loadPriorRun(runsRoot, rid)
+    assert.ok(prior, "prior run loads")
+    assert.equal(prior!.replayable, 3)
+    const before = promptCount
+    const e2 = new RunEngine(deps, rid)
+    const r2 = await e2.run({ resume: prior! })
+    assert.equal(r2.status, "completed", `resumed run should complete, error=${r2.error}`)
+    assert.equal(promptCount - before, 1, "only the synthesis agent should call the model again")
+    const s2: any = JSON.parse(readFileSync(join(runsRoot, rid, "state.json"), "utf8"))
+    const replayed = Object.values(s2.agents).filter((a: any) => a.replayed).length
+    assert.equal(replayed, 3, "3 agents replayed")
+    assert.equal(s2.agentCount, 4)
+    assert.equal(s2.resumeCount, 1)
+    assert.equal(s2.startedAt, s1.startedAt, "original start time kept")
+    assert.ok(s2.logs.some((l: any) => /paused|stopped|exited/.test(l.message)), "prior logs carried over")
+    assert.ok(s2.logs.some((l: any) => /^resumed \(3 completed agents replay/.test(l.message)), "resume log line")
+    const final = JSON.parse(r2.result!)
+    assert.equal(final.tips.length, 3, "replayed results feed the rest of the script")
+    assert.ok(!s2.error, "error cleared on successful resume")
+    console.log(`  ok: resume replayed ${replayed} agents, re-ran 1, completed`)
+  }
+
+console.log(`\nALL TESTS PASSED (${Date.now() - t0}ms total, tmp=${tmp})`)
 }
 
 main().catch((e) => {
