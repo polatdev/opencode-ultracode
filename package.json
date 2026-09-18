@@ -1,5 +1,5 @@
 {
-  "name": "@polatdev/opencode-workflow",
+  "name": "opencode-ultracode",
   "version": "0.1.0",
   "description": "Workflow orchestration for opencode: model-authored scripts, parallel sub-agent fleet, live TUI progress view",
   "type": "module",
@@ -7,11 +7,11 @@
   "author": "Abdulkadir Polat",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/polatdev/opencode-workflow.git"
+    "url": "git+https://github.com/polatdev/opencode-ultracode.git"
   },
-  "homepage": "https://github.com/polatdev/opencode-workflow#readme",
+  "homepage": "https://github.com/polatdev/opencode-ultracode#readme",
   "bugs": {
-    "url": "https://github.com/polatdev/opencode-workflow/issues"
+    "url": "https://github.com/polatdev/opencode-ultracode/issues"
   },
   "keywords": [
     "opencode",

@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-// opencode-workflow — TUI plugin: /workflows command + progress routes.
+// opencode-ultracode — TUI plugin: /workflows command + progress routes.
 //
 // Routes:
 //   workflows        — list of runs
@@ -41,7 +41,7 @@ type Tone = "success" | "error" | "warning" | "info" | "muted" | "accent" | "tex
 type Pane = "phases" | "agents"
 
 export const plugin: TuiPluginModule = {
-  id: "opencode-workflow",
+  id: "opencode-ultracode",
   tui: async (api) => {
     const store = createStore(api, (fn) => api.lifecycle.onDispose(fn))
     // pending permission / question requests of sub-agent sessions (see requests.ts)

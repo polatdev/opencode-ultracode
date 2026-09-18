@@ -1,7 +1,7 @@
-# opencode-workflow
+# opencode-ultracode
 
-[![npm version](https://img.shields.io/npm/v/@polatdev/opencode-workflow.svg)](https://www.npmjs.com/package/@polatdev/opencode-workflow)
-[![license](https://img.shields.io/github/license/polatdev/opencode-workflow.svg)](https://github.com/polatdev/opencode-workflow/blob/main/LICENSE)
+[![npm version](https://img.shields.io/npm/v/opencode-ultracode.svg)](https://www.npmjs.com/package/opencode-ultracode)
+[![license](https://img.shields.io/github/license/polatdev/opencode-ultracode.svg)](https://github.com/polatdev/opencode-ultracode/blob/main/LICENSE)
 
 Multi-agent workflow orchestration for [opencode](https://opencode.ai). The model
 writes a small JavaScript script that fans a task out across phases of parallel
@@ -33,7 +33,7 @@ migrating dozens of files, reviewing a big diff from several angles, or
 research that needs independent verification before you trust it. A single
 agent either runs out of context or quietly narrows the job.
 
-`opencode-workflow` gives the model a `workflow` tool that decomposes such a
+`opencode-ultracode` gives the model a `workflow` tool that decomposes such a
 task into phases of parallel sub-agents with structured outputs, asks you to
 approve the plan, runs it in the background, and delivers the result back into
 your session when it is done. You get a live view of every agent, its model,
@@ -52,7 +52,7 @@ or per-project):
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "@polatdev/opencode-workflow"
+    "opencode-ultracode"
   ]
 }
 ```
@@ -64,7 +64,7 @@ or per-project `.opencode/tui.json`):
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    "@polatdev/opencode-workflow"
+    "opencode-ultracode"
   ]
 }
 ```
@@ -79,12 +79,12 @@ files:
 
 ```json
 // opencode.json
-{ "plugin": ["/path/to/opencode-workflow/src/server/index.ts"] }
+{ "plugin": ["/path/to/opencode-ultracode/src/server/index.ts"] }
 ```
 
 ```json
 // tui.json
-{ "plugin": ["/path/to/opencode-workflow/src/tui/index.tsx"] }
+{ "plugin": ["/path/to/opencode-ultracode/src/tui/index.tsx"] }
 ```
 
 ## How it works

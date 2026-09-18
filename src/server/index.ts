@@ -1,4 +1,4 @@
-// opencode-workflow — server plugin.
+// opencode-ultracode — server plugin.
 //
 // Registers the `workflow` tool (model-facing orchestration), keyword triggers
 // ("run a workflow", "ultracode", ...), a system-prompt nudge so the model
