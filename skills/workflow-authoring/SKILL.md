@@ -65,7 +65,9 @@ ALL of stage N-1's results at once (dedup across findings, early-exit on zero, c
   Pass timestamps in via `args`; vary prompts/labels by index instead of randomness.
 - Concurrency is capped (~min(16, cpus-2) parallel agents); the total agent cap is 1000.
 - Sub-agents run in their own sessions with the project's tools and permissions — for
-  long autonomous runs, pre-allow the tools agents need.
+  long autonomous runs, pre-allow the tools agents need, or start opencode with
+  `ULTRACODE_AUTO_ALLOW=1` (or a type list like `bash,edit`) so sub-agent permission
+  prompts are approved automatically. The chat session itself keeps asking.
 
 ## Quality patterns
 

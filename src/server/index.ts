@@ -54,6 +54,50 @@ export default async (input: PluginInput): Promise<Hooks> => {
   const childSessionRun = new Map<string, string>()
   const childSessions = new Set<string>()
 
+  // Opt-in auto-approval of permission prompts raised by workflow sub-agents.
+  // ULTRACODE_AUTO_ALLOW=1|true|all approves every permission a child session
+  // asks for; a comma list ("bash,edit,webfetch") approves only those types.
+  // Off by default: the project's permission config applies unchanged.
+  const autoAllow = parseAutoAllow(process.env.ULTRACODE_AUTO_ALLOW)
+
+  // Sessions opened *by* sub-agents (a task / sub-agent tool used inside a
+  // workflow agent) are workflow sessions too. They are picked up from
+  // session events; when a permission arrives before the event did, the
+  // parentID chain is walked through the API instead. Both paths memoize.
+  const descendantSessions = new Set<string>()
+  const parentOf = new Map<string, string | undefined>()
+  const isTracked = (id: string): boolean => childSessions.has(id) || descendantSessions.has(id)
+  const noteSession = (info: { id?: string; parentID?: string } | undefined): void => {
+    if (!info?.id) return
+    parentOf.set(info.id, info.parentID)
+    if (info.parentID && isTracked(info.parentID)) descendantSessions.add(info.id)
+  }
+  const isWorkflowSession = async (sessionID: string): Promise<boolean> => {
+    if (isTracked(sessionID)) return true
+    const chain: string[] = []
+    let id: string | undefined = sessionID
+    while (id && chain.length < 16 && !chain.includes(id)) {
+      chain.push(id)
+      if (!parentOf.has(id)) {
+        try {
+          const res: any = await input.client.session.get({ path: { id } })
+          const info = res?.data ?? res
+          parentOf.set(id, typeof info?.parentID === "string" ? info.parentID : undefined)
+        } catch {
+          return false
+        }
+      }
+      const parent: string | undefined = parentOf.get(id)
+      if (!parent) return false
+      if (isTracked(parent)) {
+        for (const s of chain) descendantSessions.add(s)
+        return true
+      }
+      id = parent
+    }
+    return false
+  }
+
   const log = (level: "debug" | "info" | "warn" | "error", message: string, meta?: Record<string, unknown>) => {
     try {
       input.client.app.log({ body: { level, service: "workflow", message, ...meta } }).catch(() => {})
@@ -329,6 +373,20 @@ export default async (input: PluginInput): Promise<Hooks> => {
       if (label && !childSessions.has(i.sessionID)) sessionModel.set(i.sessionID, label)
     },
 
+    // With auto-allow on, permission prompts raised inside workflow child
+    // sessions are approved here instead of reaching the user. The main
+    // session (including the plan approval prompt) is never affected.
+    "permission.ask": async (perm, output) => {
+      if (!autoAllow) return
+      if (!(await isWorkflowSession(perm.sessionID))) return
+      if (autoAllow !== "all" && !autoAllow.has(perm.type)) return
+      output.status = "allow"
+      log("info", `auto-allowed ${perm.type} permission for workflow sub-agent`, {
+        sessionID: perm.sessionID,
+        pattern: Array.isArray(perm.pattern) ? perm.pattern.join(", ") : perm.pattern,
+      })
+    },
+
     "chat.message": async (i, o) => {
       if (childSessions.has(i.sessionID)) return
       const text = (o.parts ?? []).map((p) => (p as any).type === "text" ? (p as any).text ?? "" : "").join("\n")
@@ -348,6 +406,7 @@ export default async (input: PluginInput): Promise<Hooks> => {
 
     event: async ({ event }) => {
       const e = event as any
+      if (e?.type === "session.created" || e?.type === "session.updated") noteSession(e.properties?.info)
       if (e?.type === "message.part.updated") {
         const part = e.properties?.part
         const runId = part?.sessionID ? childSessionRun.get(part.sessionID) : undefined
@@ -378,6 +437,15 @@ export default async (input: PluginInput): Promise<Hooks> => {
 }
 
 // --- small helpers -----------------------------------------------------------
+
+/** ULTRACODE_AUTO_ALLOW → false (off), "all", or the set of permission types to allow. */
+function parseAutoAllow(raw: string | undefined): false | "all" | Set<string> {
+  const v = (raw ?? "").trim().toLowerCase()
+  if (!v || v === "0" || v === "false" || v === "off" || v === "no") return false
+  if (v === "1" || v === "true" || v === "all" || v === "*" || v === "yes") return "all"
+  const types = new Set(v.split(",").map((t) => t.trim()).filter(Boolean))
+  return types.size ? types : false
+}
 
 function safeName(n: string): string {
   return n.replace(/[^a-zA-Z0-9_-]/g, "-")
