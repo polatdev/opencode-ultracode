@@ -30,8 +30,9 @@ For script format (meta block, primitives, patterns), load the \`workflow-author
 
 const TOOL_DESCRIPTION = `Run a multi-agent workflow: parallel sub-agents over phases with structured outputs, for tasks too large for one pass.
 Args: one of \`script\` (inline JS workflow, must start with \`export const meta = { name, description, phases? }\`), \`scriptPath\` (file), or \`name\` (saved workflow in .opencode/workflows/). Optional \`args\` passed to the script.
-The run starts in the background after the user approves the plan; a result turn is delivered when it finishes. The user can watch progress in /workflows (phases, per-agent model/tokens/time, stop/pause).
-\`resumeRunId\`: restart a run that was stopped or whose engine died (opencode exited while it ran). Completed agents replay from the journal; the rest run again. The user can also do this with \`p\` in /workflows.
+The run starts in the background after the user approves the plan; a result turn is delivered when it finishes. The user can watch progress in /workflows (phases, per-agent model/tokens/time, stop/pause, and per-agent retry/pause/stop).
+A failed agent does not hand null to the script right away: the script waits while the user retries it in the same session (R, with a note) or skips it (X).
+\`resumeRunId\`: restart a run that was stopped or whose engine died (opencode exited while it ran). Completed agents replay from the journal; unfinished agents continue in their own sessions. With \`retryAgentId\` (+ \`retryNote\`) one failed agent of a stopped OR completed run is retried in its session and the script re-executes with its new result. The user can also do this with \`p\` / \`R\` in /workflows.
 Use for: audits, multi-file migrations, code review across many files, research sweeps, anything parallelizable or needing independent verification.
 Authoring guide: the workflow-authoring skill (bundled with this plugin; load it first) documents agent()/parallel()/pipeline()/phase()/log(), schema-validated structured output, and quality patterns.`
 
@@ -183,12 +184,21 @@ export default async (input: PluginInput): Promise<Hooks> => {
    */
   const resumeRun = async (
     runId: string,
-    opts: { runsRoot: string; notifySessionID?: string },
-  ): Promise<{ ok: true; name: string; replayable: number } | { ok: false; reason: string }> => {
+    opts: { runsRoot: string; notifySessionID?: string; retryNotes?: Record<string, string> },
+  ): Promise<{ ok: true; name: string; replayable: number; continuable: number } | { ok: false; reason: string }> => {
     if (active.has(runId)) return { ok: false, reason: "run is already live in this opencode" }
     const prior = loadPriorRun(opts.runsRoot, runId)
     if (!prior) return { ok: false, reason: "no state.json/script.js for that run" }
-    if (prior.state.status === "completed") return { ok: false, reason: "run already completed" }
+    const retrying = Object.keys(opts.retryNotes ?? {})
+    for (const id of retrying) {
+      const a = prior.state.agents[id]
+      if (!a) return { ok: false, reason: `no agent ${id} in that run` }
+      if (a.status === "completed") return { ok: false, reason: `${a.label} completed; only failed, cancelled or paused agents can be retried` }
+    }
+    // a completed run is only re-executed when the user retries one of its
+    // agents: the retried agent continues, agents whose input changes re-run,
+    // everything else replays
+    if (prior.state.status === "completed" && !retrying.length) return { ok: false, reason: "run already completed" }
     const mainSessionID = prior.state.mainSessionID ?? opts.notifySessionID ?? ""
     const availableModels = await fetchModels()
     const engine = new RunEngine(
@@ -209,9 +219,10 @@ export default async (input: PluginInput): Promise<Hooks> => {
       runId,
     )
     active.set(runId, engine)
-    log("info", `resuming workflow run ${runId} (${prior.replayable} agents replay)`)
+    const continuable = [...prior.continuable.values()].reduce((n, l) => n + l.length, 0)
+    log("info", `resuming workflow run ${runId} (${prior.replayable} agents replay, ${continuable} continue their session)`)
     engine
-      .run({ resume: prior })
+      .run({ resume: prior, retryNotes: opts.retryNotes })
       .then((res) => {
         active.delete(runId)
         for (const [sid, rid] of childSessionRun) if (rid === runId) childSessionRun.delete(sid)
@@ -222,12 +233,14 @@ export default async (input: PluginInput): Promise<Hooks> => {
         active.delete(runId)
         log("error", `resumed workflow run ${runId} crashed: ${errMsg(e)}`)
       })
-    return { ok: true, name: prior.state.name, replayable: prior.replayable }
+    return { ok: true, name: prior.state.name, replayable: prior.replayable, continuable }
   }
 
   // The TUI can only write files. A live engine consumes its own control.json;
   // a control file next to a run with NO engine in this process is a request
-  // aimed at us: "resume" restarts the run, anything else is stale and dropped.
+  // aimed at us: "resume" restarts the run, "retry" of one agent restarts the
+  // run and continues that agent with the user's note; anything else is stale
+  // and dropped.
   const pollOrphanControls = () => {
     let names: string[]
     const root = runsRootHere()
@@ -249,9 +262,12 @@ export default async (input: PluginInput): Promise<Hooks> => {
       try {
         rmSync(cp, { force: true })
       } catch {}
-      const wantResume = ctl?.action === "resume" || ctl?.resume === true
-      if (!wantResume) continue
-      resumeRun(runId, { runsRoot: root })
+      const agentId = typeof ctl?.agentId === "string" && ctl.agentId ? ctl.agentId : undefined
+      const wantRetry = agentId && (ctl?.action === "retry" || ctl?.action === "resume")
+      const wantResume = !agentId && (ctl?.action === "resume" || ctl?.resume === true)
+      if (!wantRetry && !wantResume) continue
+      const note = typeof ctl?.note === "string" ? ctl.note.trim() : ""
+      resumeRun(runId, { runsRoot: root, retryNotes: wantRetry ? { [agentId]: note } : undefined })
         .then((r) => {
           if (!r.ok) log("warn", `cannot resume ${runId}: ${r.reason}`)
         })
@@ -267,18 +283,21 @@ export default async (input: PluginInput): Promise<Hooks> => {
       scriptPath: tool.schema.string().optional().describe("Path to a workflow script file"),
       name: tool.schema.string().optional().describe("Saved workflow name (.opencode/workflows/<name>.js)"),
       args: tool.schema.any().optional().describe("Value passed to the script as global `args` (real JSON, not a stringified list)"),
-      resumeRunId: tool.schema.string().optional().describe("Resume a stopped run (its engine died) by runId: completed agents replay, the rest run again"),
+      resumeRunId: tool.schema.string().optional().describe("Resume a stopped run (its engine died) by runId: completed agents replay, unfinished agents continue in their own sessions"),
+      retryAgentId: tool.schema.string().optional().describe("With resumeRunId: the id (e.g. ag-002) of a failed/cancelled agent to retry; it continues in its own session with retryNote appended. Also works on a completed run."),
+      retryNote: tool.schema.string().optional().describe("With retryAgentId: a note for the agent about what to fix or do differently"),
     },
     execute: async (args, ctx) => {
       if (args.resumeRunId) {
         const r = await resumeRun(args.resumeRunId, {
           runsRoot: runsRoot(projectRootOf(input.worktree, ctx.directory)),
           notifySessionID: ctx.sessionID,
+          retryNotes: args.retryAgentId ? { [args.retryAgentId]: args.retryNote ?? "" } : undefined,
         })
         if (!r.ok) return { title: "workflow: cannot resume", output: `Run ${args.resumeRunId} cannot be resumed: ${r.reason}` }
         return {
           title: `workflow: ${r.name} resumed`,
-          output: `Workflow "${r.name}" resumed (runId ${args.resumeRunId}); ${r.replayable} completed agent(s) replay from the journal, the rest run again. A result turn will arrive automatically when it finishes — do not poll.`,
+          output: `Workflow "${r.name}" resumed (runId ${args.resumeRunId}); ${r.replayable} completed agent(s) replay from the journal, ${r.continuable} unfinished agent(s) continue in their own session${args.retryAgentId ? ` (${args.retryAgentId} with your note)` : ""}. A result turn will arrive automatically when it finishes — do not poll.`,
           metadata: { runId: args.resumeRunId },
         }
       }

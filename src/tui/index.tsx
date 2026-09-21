@@ -29,7 +29,7 @@ import {
   shortModel,
   wrapWords,
 } from "../shared/format.ts"
-import type { AgentState, PhaseState, RunState } from "../shared/state.ts"
+import { isSettled, type AgentState, type PhaseState, type RunState } from "../shared/state.ts"
 import { createStore, isLive, type WorkflowStore } from "./store.ts"
 import { createRequestStore, describeRequest, type PendingRequest, type PermissionReply, type RequestStore } from "./requests.ts"
 
@@ -224,6 +224,94 @@ export const plugin: TuiPluginModule = {
       }
       store.deleteRun(run.runId)
       api.ui.toast({ variant: "success", message: `Deleted run: ${run.name}` })
+    }
+
+    // --- per-agent actions (R retry · P pause/resume · X stop) ------------------
+
+    /** the agent the agent-level keys act on: the open one, else the selected one of the run view */
+    const targetAgent = (): { run: RunState; agent: AgentState } | undefined => {
+      const run = activeRun()
+      if (!run) return undefined
+      const id = api.route.current.name === "workflow-agent" ? agentOpenId() : store.selAgent()
+      const agent = id ? run.agents[id] : undefined
+      if (!agent) {
+        api.ui.toast({ variant: "info", message: "Select an agent first (→ then ↑↓)" })
+        return undefined
+      }
+      return { run, agent }
+    }
+    const engineLive = (run: RunState) => isLive(run.status) && !store.isStale(run)
+
+    /** R: continue the agent in its own session, with the last error and an optional note */
+    const doAgentRetry = () => {
+      const hit = targetAgent()
+      if (!hit) return
+      const { run, agent } = hit
+      if (agent.status === "completed") {
+        api.ui.toast({ variant: "info", message: `${agent.label} completed — only failed, cancelled or paused agents can be retried` })
+        return
+      }
+      if (engineLive(run) && (agent.status === "failed" || agent.status === "cancelled") && !agent.held) {
+        api.ui.toast({ variant: "warning", message: `${agent.label}: the script already moved on with null — press R again after the run ends to re-run it with a retry`, duration: 8000 })
+        return
+      }
+      const what =
+        agent.status === "running" ? "interrupt and steer" : agent.status === "paused" ? "resume with a note" : engineLive(run) ? "retry in its session" : "resume the run and retry"
+      api.ui.dialog.replace(() => (
+        <api.ui.DialogPrompt
+          title={`${what} · ${clip(agent.label, 40)}`}
+          placeholder={agent.error ? `note for the agent (its last error: ${clip(oneLine(agent.error), 50)})` : "note for the agent (optional, ⏎ to skip)"}
+          onConfirm={(note) => {
+            api.ui.dialog.clear()
+            store.control(run.runId, "retry", { agentId: agent.id, note: note.trim() || undefined })
+            api.ui.toast({
+              variant: "info",
+              message: engineLive(run)
+                ? `${agent.label}: retry sent${note.trim() ? " with your note" : ""} — continues in its own session`
+                : `Resume requested for ${run.name} — ${agent.label} continues in its session${note.trim() ? " with your note" : ""}, completed agents replay`,
+              duration: 6000,
+            })
+          }}
+          onCancel={() => api.ui.dialog.clear()}
+        />
+      ))
+    }
+
+    /** P: pause a running agent (session kept) or resume a paused one */
+    const doAgentPause = () => {
+      const hit = targetAgent()
+      if (!hit) return
+      const { run, agent } = hit
+      if (!engineLive(run)) {
+        api.ui.toast({ variant: "info", message: `${run.name} is not running — p resumes the whole run` })
+        return
+      }
+      if (agent.status === "running" || agent.status === "queued") {
+        store.control(run.runId, "pause", { agentId: agent.id })
+        api.ui.toast({ variant: "info", message: `Pausing ${agent.label}… its session is kept` })
+      } else if (agent.status === "paused") {
+        store.control(run.runId, "resume", { agentId: agent.id })
+        api.ui.toast({ variant: "info", message: `Resuming ${agent.label} in its session` })
+      } else {
+        api.ui.toast({ variant: "info", message: `${agent.label} is ${agent.status}${agent.held ? " — R retries, X skips" : ""}` })
+      }
+    }
+
+    /** X: stop one agent; the script gets null for it */
+    const doAgentStop = () => {
+      const hit = targetAgent()
+      if (!hit) return
+      const { run, agent } = hit
+      if (!engineLive(run)) {
+        api.ui.toast({ variant: "info", message: `${run.name} is not running` })
+        return
+      }
+      if (agent.status === "running" || agent.status === "queued" || agent.status === "paused" || agent.held) {
+        store.control(run.runId, "stop", { agentId: agent.id })
+        api.ui.toast({ variant: "warning", message: `${agent.held ? "Skipping" : "Stopping"} ${agent.label} — the script gets null for it` })
+      } else {
+        api.ui.toast({ variant: "info", message: `${agent.label} is already ${agent.status}` })
+      }
     }
 
     // --- permission / question requests -------------------------------------------
@@ -429,6 +517,10 @@ export const plugin: TuiPluginModule = {
         { name: "wf.run.save", run: () => doSave(activeRun()) },
         { name: "wf.run.result", run: () => openResult(activeRun()) },
         { name: "wf.run.back", run: () => goBack() },
+        // one agent (run view + agent view)
+        { name: "wf.agent.retry", run: () => doAgentRetry() },
+        { name: "wf.agent.pause", run: () => doAgentPause() },
+        { name: "wf.agent.stop", run: () => doAgentStop() },
         // agent
         { name: "wf.agent.prev", run: () => stepAgent(-1) },
         { name: "wf.agent.next", run: () => stepAgent(1) },
@@ -489,6 +581,9 @@ export const plugin: TuiPluginModule = {
         { key: "p", cmd: "wf.run.pause" },
         { key: "s", cmd: "wf.run.save" },
         { key: "r", cmd: "wf.run.result" },
+        { key: "shift+r", cmd: "wf.agent.retry" },
+        { key: "shift+p", cmd: "wf.agent.pause" },
+        { key: "shift+x", cmd: "wf.agent.stop" },
         { key: "!", cmd: "wf.waiting" },
         { key: "escape", cmd: "wf.run.back" },
       ],
@@ -508,6 +603,9 @@ export const plugin: TuiPluginModule = {
         { key: "l", cmd: "wf.agent.next" },
         { key: "e", cmd: "wf.agent.expand" },
         { key: "p", cmd: "wf.agent.prompt" },
+        { key: "shift+r", cmd: "wf.agent.retry" },
+        { key: "shift+p", cmd: "wf.agent.pause" },
+        { key: "shift+x", cmd: "wf.agent.stop" },
         { key: "enter", cmd: "wf.agent.respond" },
         { key: "!", cmd: "wf.waiting" },
         { key: "escape", cmd: "wf.agent.back" },
@@ -564,7 +662,28 @@ export const plugin: TuiPluginModule = {
       },
     ])
 
-    // --- attention on terminal transition ------------------------------------------
+    // --- attention on terminal transition / an agent waiting for a decision ---------
+
+    const heldNotified = new Set<string>()
+    createEffect(() => {
+      for (const r of runs()) {
+        if (!isLive(r.status) || store.isStale(r)) continue
+        for (const id of r.agentOrder) {
+          const a = r.agents[id]
+          if (!a?.held || a.status !== "failed") continue
+          const key = `${r.runId}/${id}/${a.attempts ?? 0}`
+          if (heldNotified.has(key)) continue
+          heldNotified.add(key)
+          try {
+            api.attention.notify({
+              title: "Workflow agent failed",
+              message: `${a.label} — ${clip(oneLine(a.error ?? ""), 80)} · R retries in its session, X skips`,
+              sound: { name: "error" },
+            })
+          } catch {}
+        }
+      }
+    })
 
     createEffect(() => {
       for (const r of runs()) {
@@ -1038,6 +1157,16 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
   const phasesW = () => (narrow() ? 26 : 32)
   const waiting = () => reqs.waitingAgents(run)
   const waitingIn = (p: PhaseState) => p.agentIds.some((id) => reqs.forAgent(run.agents[id]).length > 0)
+  /** agents the script is blocked on: failed and waiting for R / X, or paused */
+  const held = () => run.agentOrder.map((id) => run.agents[id]).filter((a) => a && (a.held || a.status === "paused")) as AgentState[]
+  const heldLabel = () => {
+    const failed = held().filter((a) => a.status === "failed").length
+    const paused = held().length - failed
+    const parts: string[] = []
+    if (failed) parts.push(`${failed} failed — R retries · X skips`)
+    if (paused) parts.push(`${paused} paused — P resumes`)
+    return parts.join("   ")
+  }
 
   let phaseScroll: ScrollBoxRenderable | undefined
   let agentScroll: ScrollBoxRenderable | undefined
@@ -1111,16 +1240,19 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
           <Show when={waiting().length > 0}>
             <text style={{ fg: t().warning, attributes: BOLD }}>{`${waitingLabel(waiting().length)} — ! answers   `}</text>
           </Show>
-          <Show when={store.pendingControl(run.runId) === "resume"}>
-            <text style={{ fg: t().warning }}>resume requested — waiting for the engine…</text>
+          <Show when={held().length > 0 && live() && !store.isStale(run)}>
+            <text style={{ fg: t().error, attributes: BOLD }}>{`⚠ ${heldLabel()}   `}</text>
           </Show>
-          <Show when={store.pendingControl(run.runId) !== "resume" && store.isStale(run)}>
+          <Show when={store.pendingControl(run.runId) === "resume" || store.pendingControl(run.runId) === "retry"}>
+            <text style={{ fg: t().warning }}>{`${store.pendingControl(run.runId)} requested — waiting for the engine…`}</text>
+          </Show>
+          <Show when={!store.pendingControl(run.runId) && store.isStale(run)}>
             <text style={{ fg: t().warning }}>engine gone — p resumes</text>
           </Show>
-          <Show when={store.pendingControl(run.runId) !== "resume" && !store.isStale(run) && (run.status === "paused" || run.status === "stopped")}>
-            <text style={{ fg: t().warning }}>{`${run.status} — p resumes`}</text>
+          <Show when={!store.pendingControl(run.runId) && !store.isStale(run) && (run.status === "paused" || run.status === "stopped")}>
+            <text style={{ fg: t().warning }}>{`${run.status} — p resumes · R retries one agent`}</text>
           </Show>
-          <Show when={run.status !== "paused" && !store.isStale(run) && !narrow()}>
+          <Show when={run.status !== "paused" && !store.isStale(run) && !narrow() && !held().length}>
             <text style={{ fg: t().textMuted }}>{clip(modelsOf(run), 40)}</text>
           </Show>
         </box>
@@ -1148,9 +1280,10 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
                 const running = () => p.agentIds.some((id) => run.agents[id]?.status === "running")
                 const done = () => total() > 0 && p.done === total()
                 const failed = () => p.agentIds.some((id) => run.agents[id]?.status === "failed")
+                const heldHere = () => p.agentIds.some((id) => run.agents[id]?.held || run.agents[id]?.status === "paused")
                 const blocked = () => waitingIn(p)
-                const glyph = () => (blocked() ? "⚠" : running() ? store.spinner() : done() ? (failed() ? "✗" : "✓") : total() ? "◔" : "○")
-                const gTone = (): Tone => (blocked() ? "warning" : running() ? "accent" : done() ? (failed() ? "error" : "success") : "muted")
+                const glyph = () => (blocked() ? "⚠" : heldHere() && !running() ? "‖" : running() ? store.spinner() : done() ? (failed() ? "✗" : "✓") : total() ? "◔" : "○")
+                const gTone = (): Tone => (blocked() ? "warning" : heldHere() && !running() ? "error" : running() ? "accent" : done() ? (failed() ? "error" : "success") : "muted")
                 const titleW = () => phasesW() - 2 - 2 - 3 - 8 - 1
                 return (
                   <box flexDirection="row" style={{ paddingLeft: 1, paddingRight: 1, height: 1, backgroundColor: isSel() ? t().backgroundElement : "transparent" }}>
@@ -1201,8 +1334,17 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
                         <text style={{ fg: faint(), width: A.billed }}>{cellR(fmtTok(a()!.tokens), A.billed)}</text>
                       </Show>
                       <text style={{ fg: dim(), width: A.tools }}>{cellR(a()!.toolCalls ? `${a()!.toolCalls} tool${a()!.toolCalls === 1 ? "" : "s"}` : "", A.tools)}</text>
-                      <text style={{ fg: agentShownStatus(reqs, a()) === "waiting" ? t().warning : a()!.status === "running" ? t().accent : dim(), width: A.time }}>
-                        {cellR(agentShownStatus(reqs, a()) === "waiting" ? "waiting" : fmtElapsed(a()!.startedAt, a()!.endedAt, store.now()), A.time)}
+                      <text
+                        style={{
+                          fg: agentShownStatus(reqs, a()) === "waiting" ? t().warning : a()!.held ? t().error : a()!.status === "paused" ? t().warning : a()!.status === "running" ? t().accent : dim(),
+                          width: A.time,
+                          attributes: a()!.held || a()!.status === "paused" ? BOLD : 0,
+                        }}
+                      >
+                        {cellR(
+                          agentShownStatus(reqs, a()) === "waiting" ? "waiting" : a()!.held ? "R retry" : a()!.status === "paused" ? "P resume" : fmtElapsed(a()!.startedAt, a()!.endedAt, store.now()),
+                          A.time,
+                        )}
                       </text>
                     </box>
                   </Show>
@@ -1267,6 +1409,7 @@ function RunView(props: ScreenProps & { run: RunState; pane: () => Pane }) {
             ["x", "stop"],
             ["p", pauseLabel(store, run)],
             ["s", "save"],
+            ...(props.pane() === "agents" ? ([["R", "retry agent"], ["P", "pause agent"], ["X", "stop agent"]] as Array<[string, string]>) : []),
             ...(waiting().length ? ([["!", "answer permission"]] as Array<[string, string]>) : []),
             ["esc", "back"],
           ]}
@@ -1306,7 +1449,7 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
   const { t, tone, faint } = useTheme(api)
   const width = () => store.size().width
   const bodyW = () => Math.max(30, width() - 8)
-  const running = () => a.status === "running" || a.status === "queued"
+  const running = () => !isSettled(a) && a.status !== "failed"
   const pending = () => reqs.forAgent(a)
   const shown = () => agentShownStatus(reqs, a)
   const outcome = () => a.outcomeText ?? (typeof a.outcome === "string" ? a.outcome : a.outcome ? JSON.stringify(a.outcome, null, 2) : "")
@@ -1372,8 +1515,26 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
             </For>
           </Show>
 
+          {/* the script is waiting on this agent: retry / skip / resume */}
+          <Show when={a.held || a.status === "paused"}>
+            <box flexDirection="row" style={{ paddingTop: 1 }}>
+              <text style={{ fg: a.status === "paused" ? t().warning : t().error, attributes: BOLD }}>
+                {a.status === "paused" ? "‖ Paused — the script is waiting" : "⚠ Failed — the script is waiting for your decision"}
+              </text>
+            </box>
+            <text style={{ fg: t().textMuted }}>
+              {a.status === "paused"
+                ? "P resumes in the same session · R resumes with a note · X stops it (the script gets null)"
+                : "R retries in the same session with the error below and an optional note · X skips it (the script gets null)"}
+            </text>
+          </Show>
+          <Show when={a.retryNote}>
+            <SectionTitle api={api} title="Your note" hint={() => (a.attempts ? `attempt ${a.attempts}` : "")} />
+            <TextBlock api={api} text={() => a.retryNote ?? ""} width={bodyW} maxLines={4} fg={() => t().text} />
+          </Show>
+
           <Show when={a.error}>
-            <SectionTitle api={api} title="Error" />
+            <SectionTitle api={api} title="Error" hint={() => (a.attempts && a.attempts > 1 ? `after ${a.attempts} attempts` : "")} />
             <TextBlock api={api} text={() => a.error ?? ""} width={bodyW} fg={() => t().error} />
           </Show>
 
@@ -1445,6 +1606,9 @@ function AgentView(props: ScreenProps & { run: RunState; agent: AgentState; scro
             ["←→", "prev/next agent"],
             ["e", store.expandActivity() ? "hide previews" : "show previews"],
             ["p", store.fullPrompt() ? "collapse" : "expand text"],
+            ["R", a.status === "running" ? "steer" : "retry"],
+            ["P", a.status === "paused" ? "resume" : "pause"],
+            ["X", a.held ? "skip" : "stop"],
             ["esc", "back"],
           ]}
         />

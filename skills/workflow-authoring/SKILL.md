@@ -38,7 +38,10 @@ export const meta = {
 
 - `agent(prompt, opts?)` → spawns a sub-agent in an isolated child session; resolves to
   its structured result (with `schema`) or final text (without). Resolves to `null` if
-  the run is stopped or the agent fails — filter with `.filter(Boolean)`.
+  the run is stopped or the user skips a failed agent — filter with `.filter(Boolean)`.
+  A failed agent is retried automatically first (same session); if it still fails the
+  script waits on that one result while the user retries it with a note (R) or skips
+  it (X) in /workflows. Other agents keep running meanwhile.
   - `opts.label` — display name (shown in /workflows), e.g. `'tip:design'`
   - `opts.phase` — assign to a progress group (use inside pipeline/parallel stages)
   - `opts.schema` — JSON Schema; the agent is forced to return a matching JSON object

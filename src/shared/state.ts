@@ -16,6 +16,8 @@ export type RunStatus =
 export type AgentStatus =
   | "queued"
   | "running"
+  /** paused by the user (P in the TUI); its session is kept and continues on resume */
+  | "paused"
   | "completed"
   | "failed"
   | "cancelled"
@@ -90,6 +92,17 @@ export interface AgentState {
   sessionId?: string
   /** true when this agent's result was replayed from a previous run of the same runId (resume) */
   replayed?: boolean
+  /** true when this agent picked up its own earlier session after a resume (nothing was redone) */
+  continued?: boolean
+  /**
+   * failed (or paused) while the script still waits for its result: the run is
+   * blocked on a decision — retry in the same session (R) or skip with null (X)
+   */
+  held?: boolean
+  /** how many prompts this agent has been sent (automatic retries and user retries included) */
+  attempts?: number
+  /** the last note the user attached to a retry */
+  retryNote?: string
 }
 
 export interface RunLogEntry {
@@ -146,14 +159,30 @@ export interface RunState {
  * control.json written by the TUI. A live engine polls it for pause/resume/stop.
  * `resume` on a run with no live engine (opencode exited while it ran) asks the
  * server plugin to restart the run: completed agents replay from the journal,
- * the rest run again.
+ * the rest continue in their own sessions.
+ *
+ * With `agentId` the action targets ONE agent of a live run:
+ * - `pause`  aborts the agent's current generation; its session is kept
+ * - `resume` continues a paused agent in the same session
+ * - `retry`  continues a failed/paused/running agent in the same session with
+ *            its last error and the optional `note` appended to the prompt
+ * - `stop`   aborts the agent and hands `null` to the script (skip)
+ * `retry` on a run with no live engine resumes the whole run and continues that
+ * agent with the note.
  */
 export interface ControlState {
-  action?: "pause" | "resume" | "stop"
+  action?: "pause" | "resume" | "stop" | "retry"
+  agentId?: string
+  note?: string
   pause?: boolean
   resume?: boolean
   stop?: boolean
   at?: number
+}
+
+/** true when the script has this agent's final answer (null counts) */
+export function isSettled(a: Pick<AgentState, "status" | "held">): boolean {
+  return a.status !== "queued" && a.status !== "running" && a.status !== "paused" && !a.held
 }
 
 // --- wire helpers -----------------------------------------------------------

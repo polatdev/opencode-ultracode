@@ -312,6 +312,288 @@ return out
     console.log(`  ok: resume replayed ${replayed} agents, re-ran 1, completed`)
   }
 
+  // ---- test 6: a failed agent holds the script; retry continues in its session --
+  console.log("test 6: failed agent waits for a decision — R retries in the same session with the note, X skips")
+  {
+    const SCHEMA_SCRIPT = `
+export const meta = { name: "t6", description: "hold", phases: [{ title: "A" }] }
+phase("A")
+const out = await parallel([
+  () => agent("FAILME first task", { label: "flaky", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } }),
+  () => agent("FAILME second task", { label: "hopeless", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } }),
+])
+log("out:" + JSON.stringify(out))
+return out
+`
+    const prompts: Array<{ session: string; text: string }> = []
+    let seq = 0
+    const client = {
+      session: {
+        async create() {
+          return { id: `ses_t6_${++seq}` }
+        },
+        async prompt(args: any) {
+          const text = String(args.body?.parts?.[0]?.text ?? "")
+          prompts.push({ session: args.path.id, text })
+          // only a follow-up carrying the user's note is answered correctly
+          const good = /Note from the user: please just answer/.test(text)
+          return { info: assistantMsg(args.path.id), parts: [{ type: "text", text: good ? '{"ok":true}' : "sorry, no json here" }] }
+        },
+        async abort() {
+          return true
+        },
+      },
+    }
+    const rid = generateRunId()
+    const engine = new RunEngine({ client: client as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set() }, rid)
+    const done = engine.run({ script: SCHEMA_SCRIPT })
+    const stateOf = () => JSON.parse(readFileSync(join(runsRoot, rid, "state.json"), "utf8"))
+    const waitFor = async (pred: (s: any) => boolean, what: string) => {
+      for (let i = 0; i < 100; i++) {
+        engine.flushNow()
+        const s = stateOf()
+        if (pred(s)) return s
+        await new Promise((r) => setTimeout(r, 50))
+      }
+      throw new Error(`timed out waiting for: ${what}`)
+    }
+    const s1 = await waitFor((s) => Object.values(s.agents).filter((a: any) => a.held).length === 2, "both agents held")
+    const flaky = Object.values(s1.agents).find((a: any) => a.label === "flaky") as any
+    const hopeless = Object.values(s1.agents).find((a: any) => a.label === "hopeless") as any
+    assert.equal(flaky.status, "failed")
+    assert.equal(flaky.attempts, 2, "two automatic attempts before holding")
+    assert.ok(/not valid JSON/.test(flaky.error), flaky.error)
+    assert.equal(s1.status, "running", "run keeps running while agents are held")
+    assert.equal(s1.agentDone, 0, "held agents do not count as done")
+    // both automatic attempts went to the same session; the second was a follow-up (no TASK repeated)
+    const flakyPrompts = prompts.filter((p) => p.session === flaky.sessionId)
+    assert.equal(flakyPrompts.length, 2)
+    assert.ok(/--- TASK ---/.test(flakyPrompts[0].text) && !/--- TASK ---/.test(flakyPrompts[1].text), "automatic retry is a follow-up in the same session")
+    assert.ok(/Your previous attempt did not go through — previous response was not valid JSON/.test(flakyPrompts[1].text), "the follow-up carries the error")
+
+    // R with a note on the first, X on the second (what the TUI writes to control.json)
+    writeFileSync(join(runsRoot, rid, "control.json"), JSON.stringify({ action: "retry", agentId: flaky.id, note: "please just answer", at: 1 }))
+    await waitFor((s) => s.agents[flaky.id].status === "completed", "flaky completed after retry")
+    writeFileSync(join(runsRoot, rid, "control.json"), JSON.stringify({ action: "stop", agentId: hopeless.id, at: 1 }))
+    const r6 = await done
+    assert.equal(r6.status, "completed", `run should complete, error=${r6.error}`)
+    const s2 = stateOf()
+    assert.equal(s2.agents[flaky.id].attempts, 3)
+    assert.equal(s2.agents[flaky.id].retryNote, "please just answer")
+    assert.equal(s2.agents[flaky.id].held, false)
+    assert.deepEqual(s2.agents[flaky.id].outcome, { ok: true })
+    assert.equal(s2.agents[hopeless.id].status, "failed", "skipped agent keeps its failure")
+    assert.equal(s2.agents[hopeless.id].held, false)
+    const retryPrompt = prompts.filter((p) => p.session === flaky.sessionId)[2].text
+    assert.ok(/Note from the user: please just answer/.test(retryPrompt) && /not valid JSON/.test(retryPrompt) && !/--- TASK ---/.test(retryPrompt), "user retry = same session, error + note, no task repeat")
+    assert.equal(prompts.filter((p) => p.session === flaky.sessionId).length, 3, "three prompts, one session")
+    assert.equal(seq, 2, "no new sessions were created")
+    assert.ok(s2.logs.some((l: any) => l.message === "out:[{\"ok\":true},null]"), "script saw the retried result and null for the skipped one")
+    console.log("  ok: hold → retry with note (same session) → completed; hold → skip → null")
+  }
+
+  // ---- test 7: pause / resume one agent while it runs ---------------------------
+  console.log("test 7: P pauses one running agent (session kept), P again resumes it in the same session")
+  {
+    const S7 = `
+export const meta = { name: "t7", description: "pause one agent", phases: [{ title: "A" }] }
+phase("A")
+const [slow, fast] = await parallel([() => agent("slow task", { label: "slow" }), () => agent("fast task", { label: "fast" })])
+return { slow, fast }
+`
+    let seq = 0
+    const prompts: Array<{ session: string; text: string }> = []
+    let releaseSlow: ((v: any) => void) | undefined
+    const client = {
+      session: {
+        async create(args: any) {
+          return { id: `ses_t7_${++seq}_${String(args.body?.title).split("/").pop()}` }
+        },
+        prompt(args: any) {
+          const text = String(args.body?.parts?.[0]?.text ?? "")
+          prompts.push({ session: args.path.id, text })
+          if (/_slow$/.test(args.path.id) && !/follow-up/.test(text)) {
+            // first prompt of the slow agent: generation runs until abort()
+            return new Promise((res) => {
+              releaseSlow = res
+            })
+          }
+          return Promise.resolve({ info: assistantMsg(args.path.id), parts: [{ type: "text", text: `done ${args.path.id}` }] })
+        },
+        async abort(args: any) {
+          // opencode answers the pending prompt with an aborted message
+          releaseSlow?.({ info: { ...assistantMsg(args.path.id), error: { name: "MessageAbortedError", data: { message: "aborted" } } }, parts: [] })
+          releaseSlow = undefined
+          return true
+        },
+      },
+    }
+    const rid = generateRunId()
+    const engine = new RunEngine({ client: client as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set() }, rid)
+    const done = engine.run({ script: S7 })
+    const stateOf = () => JSON.parse(readFileSync(join(runsRoot, rid, "state.json"), "utf8"))
+    const waitFor = async (pred: (s: any) => boolean, what: string) => {
+      for (let i = 0; i < 100; i++) {
+        engine.flushNow()
+        const s = stateOf()
+        if (pred(s)) return s
+        await new Promise((r) => setTimeout(r, 50))
+      }
+      throw new Error(`timed out waiting for: ${what}`)
+    }
+    const s1 = await waitFor((s) => Object.values(s.agents).some((a: any) => a.label === "fast" && a.status === "completed") && Object.values(s.agents).some((a: any) => a.label === "slow" && a.status === "running"), "fast done, slow running")
+    const slow = Object.values(s1.agents).find((a: any) => a.label === "slow") as any
+    writeFileSync(join(runsRoot, rid, "control.json"), JSON.stringify({ action: "pause", agentId: slow.id, at: 1 }))
+    await waitFor((s) => s.agents[slow.id].status === "paused" && s.agents[slow.id].held === true, "slow paused")
+    assert.equal(stateOf().status, "running", "only the agent is paused, not the run")
+    writeFileSync(join(runsRoot, rid, "control.json"), JSON.stringify({ action: "resume", agentId: slow.id, at: 1 }))
+    const r7 = await done
+    assert.equal(r7.status, "completed", `run should complete, error=${r7.error}`)
+    const s2 = stateOf()
+    assert.equal(s2.agents[slow.id].status, "completed")
+    assert.equal(s2.agents[slow.id].attempts, 2)
+    const slowPrompts = prompts.filter((p) => p.session === slow.sessionId)
+    assert.equal(slowPrompts.length, 2, "resume = one follow-up prompt in the same session")
+    assert.ok(/you were paused by the user/.test(slowPrompts[1].text), slowPrompts[1].text)
+    assert.equal(JSON.parse(r7.result!).slow, `done ${slow.sessionId}`)
+    console.log("  ok: pause kept the session, resume continued it, run completed")
+  }
+
+  // ---- test 8: resume of a dead run continues failed agents in their session, with a note --
+  console.log("test 8: resume with retryNotes — the failed agent continues its old session with the note")
+  {
+    const S8 = `
+export const meta = { name: "t8", description: "resume note", phases: [{ title: "A" }] }
+phase("A")
+const r = await agent("FAILME research", { label: "res", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } })
+return r
+`
+    const prompts: Array<{ session: string; text: string }> = []
+    let seq = 0
+    let sessionGone = false
+    const client = {
+      session: {
+        async create() {
+          return { id: `ses_t8_${++seq}` }
+        },
+        async prompt(args: any) {
+          const text = String(args.body?.parts?.[0]?.text ?? "")
+          prompts.push({ session: args.path.id, text })
+          const good = /Note from the user: use the cached data/.test(text)
+          return { info: assistantMsg(args.path.id), parts: [{ type: "text", text: good ? '{"ok":true}' : "nope" }] }
+        },
+        async abort() {
+          return true
+        },
+        async get(args: any) {
+          if (sessionGone) return { data: undefined, error: { data: { message: "not found" } } }
+          return { data: { id: args.path.id }, error: undefined }
+        },
+      },
+    }
+    const deps = { client: client as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set<string>() }
+    // first run: the agent fails and nobody decides; the engine dies (shutdown)
+    const rid = generateRunId()
+    const e1 = new RunEngine(deps, rid)
+    const p1 = e1.run({ script: S8 })
+    for (let i = 0; i < 100; i++) {
+      e1.flushNow()
+      const s = JSON.parse(readFileSync(join(runsRoot, rid, "state.json"), "utf8"))
+      if (Object.values(s.agents).some((a: any) => a.held)) break
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    e1.shutdown("opencode exited")
+    const r1 = await p1
+    assert.equal(r1.status, "stopped")
+    const s1: any = JSON.parse(readFileSync(join(runsRoot, rid, "state.json"), "utf8"))
+    const agentId = s1.agentOrder[0]
+    assert.equal(s1.agents[agentId].status, "failed")
+    assert.equal(s1.agents[agentId].held, false)
+    assert.ok(s1.agents[agentId].sessionId)
+
+    // resume with a note for that agent → same session, note in the follow-up
+    const prior = loadPriorRun(runsRoot, rid)!
+    assert.equal(prior.replayable, 0)
+    assert.equal([...prior.continuable.values()].flat().length, 1)
+    const before = prompts.length
+    const e2 = new RunEngine(deps, rid)
+    const r2 = await e2.run({ resume: prior, retryNotes: { [agentId]: "use the cached data" } })
+    assert.equal(r2.status, "completed", `resumed run should complete, error=${r2.error}`)
+    assert.equal(prompts.length - before, 1)
+    const p = prompts[prompts.length - 1]
+    assert.equal(p.session, s1.agents[agentId].sessionId, "continued in the earlier session")
+    assert.ok(/Note from the user: use the cached data/.test(p.text) && /not valid JSON/.test(p.text) && !/--- TASK ---/.test(p.text), p.text)
+    const s2: any = JSON.parse(readFileSync(join(runsRoot, rid, "state.json"), "utf8"))
+    const a2 = s2.agents[s2.agentOrder[0]]
+    assert.equal(a2.continued, true)
+    assert.equal(a2.attempts, 3, "attempt count carries over (2 before, 1 now)")
+    assert.ok(a2.tokens > s1.agents[agentId].tokens, "billed tokens carry over and grow")
+    assert.equal(seq, 1, "no new session")
+    assert.equal(JSON.parse(r2.result!).ok, true)
+
+    // the same resume when the session no longer exists → fresh session, note still delivered
+    sessionGone = true
+    const rid2 = generateRunId()
+    const e3 = new RunEngine(deps, rid2)
+    const p3 = e3.run({ script: S8 })
+    for (let i = 0; i < 100; i++) {
+      e3.flushNow()
+      const s = JSON.parse(readFileSync(join(runsRoot, rid2, "state.json"), "utf8"))
+      if (Object.values(s.agents).some((a: any) => a.held)) break
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    e3.shutdown("opencode exited")
+    await p3
+    const prior2 = loadPriorRun(runsRoot, rid2)!
+    const id2 = prior2.state.agentOrder[0]
+    const seqBefore = seq
+    const e4 = new RunEngine(deps, rid2)
+    const r4 = await e4.run({ resume: prior2, retryNotes: { [id2]: "use the cached data" } })
+    assert.equal(r4.status, "completed", r4.error)
+    assert.equal(seq, seqBefore + 1, "a fresh session was created")
+    const last = prompts[prompts.length - 1].text
+    assert.ok(/--- TASK ---/.test(last) && /Note from the user: use the cached data/.test(last), "fresh session gets the full task plus the note")
+    console.log("  ok: resume continued the old session with the note; fell back to a fresh session when it was gone")
+  }
+
+  // ---- test 9: ULTRACODE_HOLD_FAILED=0 → old behaviour (null right away) --------
+  console.log("test 9: ULTRACODE_HOLD_FAILED=0 hands null to the script immediately")
+  {
+    process.env.ULTRACODE_HOLD_FAILED = "0"
+    try {
+      const S9 = `
+export const meta = { name: "t9", description: "no hold", phases: [{ title: "A" }] }
+phase("A")
+const r = await agent("FAILME", { label: "x", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } })
+return { r }
+`
+      const client = {
+        session: {
+          async create() {
+            return { id: "ses_t9" }
+          },
+          async prompt(args: any) {
+            return { info: assistantMsg(args.path.id), parts: [{ type: "text", text: "nope" }] }
+          },
+          async abort() {
+            return true
+          },
+        },
+      }
+      const rid = generateRunId()
+      const e = new RunEngine({ client: client as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set() }, rid)
+      const r = await e.run({ script: S9 })
+      assert.equal(r.status, "completed")
+      assert.deepEqual(JSON.parse(r.result!), { r: null })
+      const s: any = JSON.parse(readFileSync(join(runsRoot, rid, "state.json"), "utf8"))
+      assert.equal(s.agents[s.agentOrder[0]].status, "failed")
+      assert.equal(s.agentDone, 1)
+      console.log("  ok: no hold, null delivered")
+    } finally {
+      delete process.env.ULTRACODE_HOLD_FAILED
+    }
+  }
+
 console.log(`\nALL TESTS PASSED (${Date.now() - t0}ms total, tmp=${tmp})`)
 }
 

@@ -38,14 +38,17 @@ export interface WorkflowStore {
   isStale: (run: RunState) => boolean
 
   runsDir: () => string
-  control: (runId: string, action: "pause" | "resume" | "stop") => void
+  /** run-level action, or with `agent` one agent of the run (see ControlState) */
+  control: (runId: string, action: ControlAction, agent?: { agentId: string; note?: string }) => void
   /** a control.json the engine has not consumed yet (e.g. resume waiting for the server plugin) */
-  pendingControl: (runId: string) => "pause" | "resume" | "stop" | undefined
+  pendingControl: (runId: string) => ControlAction | undefined
   deleteRun: (runId: string) => void
   saveScript: (run: RunState) => string | undefined
   markNotified: (runId: string) => void
   wasNotified: (runId: string) => boolean
 }
+
+export type ControlAction = "pause" | "resume" | "stop" | "retry"
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 const POLL_MS = 250
@@ -219,10 +222,11 @@ export function createStore(api: TuiPluginApi, onDispose?: (fn: () => void) => v
     },
 
     runsDir,
-    control: (runId, action) => {
+    control: (runId, action, agent) => {
       try {
         mkdirSync(join(runsDir(), runId), { recursive: true })
-        writeFileSync(controlPath(runsDir(), runId), JSON.stringify({ action, at: Date.now() }))
+        const ctl = agent ? { action, agentId: agent.agentId, note: agent.note, at: Date.now() } : { action, at: Date.now() }
+        writeFileSync(controlPath(runsDir(), runId), JSON.stringify(ctl))
       } catch {}
     },
     pendingControl: (runId) => {
@@ -230,7 +234,7 @@ export function createStore(api: TuiPluginApi, onDispose?: (fn: () => void) => v
       try {
         const raw = readFileSync(controlPath(runsDir(), runId), "utf8")
         const a = JSON.parse(raw)?.action
-        return a === "pause" || a === "resume" || a === "stop" ? a : undefined
+        return a === "pause" || a === "resume" || a === "stop" || a === "retry" ? a : undefined
       } catch {
         return undefined
       }

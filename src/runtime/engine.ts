@@ -12,6 +12,7 @@ import {
   type RunState,
   type RunStatus,
   controlPath,
+  isSettled,
   journalPath,
   runDir,
   statePath,
@@ -24,7 +25,31 @@ export interface EngineClient {
     create(args: { body: { parentID?: string; title?: string } }): Promise<any>
     prompt(args: { path: { id: string }; body: any }): Promise<any>
     abort(args: { path: { id: string } }): Promise<any>
+    /** optional: used on resume to check that an agent's earlier session still exists */
+    get?(args: { path: { id: string } }): Promise<any>
   }
+}
+
+/** what the user (or the tool) asked an agent to do next */
+type Decision = { kind: "retry"; note?: string } | { kind: "skip" }
+
+/** why the next prompt to an agent is a follow-up rather than the task itself */
+interface FollowUp {
+  /** what went wrong with the previous attempt (error text), if anything */
+  reason?: string
+  /** free-text note from the user */
+  note?: string
+  /** true when the follow-up goes to a fresh session (the earlier one is gone): the full task is repeated */
+  fresh: boolean
+}
+
+/**
+ * ULTRACODE_HOLD_FAILED=0 restores the old behaviour: a failed agent hands
+ * `null` to the script immediately instead of waiting for retry / skip.
+ */
+function holdFailedByDefault(): boolean {
+  const v = (process.env.ULTRACODE_HOLD_FAILED ?? "").trim().toLowerCase()
+  return !(v === "0" || v === "false" || v === "off" || v === "no")
 }
 
 export interface EngineDeps {
@@ -56,6 +81,12 @@ export interface RunOptions {
    * is marked `replayed`. Everything else runs for real.
    */
   resume?: PriorRun
+  /**
+   * With `resume`: notes for agents of the prior run that should be retried,
+   * keyed by that run's agent id. The agent continues in its own session with
+   * the note (see FollowUp).
+   */
+  retryNotes?: Record<string, string>
 }
 
 /** what loadPriorRun() recovers from a run folder for a resume */
@@ -66,6 +97,12 @@ export interface PriorRun {
   replay: Map<string, Array<{ result: any; agent: AgentState }>>
   /** completed agents that can be replayed */
   replayable: number
+  /**
+   * replay key -> agents that did NOT complete but still have a session
+   * (failed, cancelled, paused, or running when the engine died). A resumed
+   * run continues them in that session instead of starting over.
+   */
+  continuable: Map<string, AgentState[]>
 }
 
 /** agents are matched across runs by where they ran and what they were asked */
@@ -109,21 +146,30 @@ export function loadPriorRun(runsRootDir: string, runId: string): PriorRun | und
     }
   } catch {}
   const replay = new Map<string, Array<{ result: any; agent: AgentState }>>()
+  const continuable = new Map<string, AgentState[]>()
   let replayable = 0
   for (const id of state.agentOrder ?? Object.keys(state.agents)) {
     const a = state.agents[id]
-    if (!a || a.status !== "completed") continue
+    if (!a) continue
+    const key = replayKey(a.phase, a.label, a.prompt ?? "")
+    if (a.status !== "completed") {
+      if (a.sessionId) {
+        const list = continuable.get(key) ?? []
+        list.push(a)
+        continuable.set(key, list)
+      }
+      continue
+    }
     let result: any
     if (results.has(id)) result = results.get(id)
     else if (a.outcome !== undefined) result = a.outcome
     else continue
-    const key = replayKey(a.phase, a.label, a.prompt ?? "")
     const list = replay.get(key) ?? []
     list.push({ result, agent: a })
     replay.set(key, list)
     replayable++
   }
-  return { state, script, replay, replayable }
+  return { state, script, replay, replayable, continuable }
 }
 
 export class RunAbortedError extends Error {
@@ -159,8 +205,18 @@ export class RunEngine {
   private sem = 0
   private semMax: number
   private waiters: Array<() => void> = []
+  /** agents the user stopped individually (X): abort, then hand null to the script */
   private stoppedAgents = new Set<string>()
+  /** agents the user paused individually (P): abort, keep the session, wait for a decision */
+  private pausedAgents = new Set<string>()
+  /** retry / skip decisions waiting to be consumed by the agent's loop */
+  private decisions = new Map<string, Decision>()
+  /** token/cost totals an agent brought along from its earlier run (resume continues its session) */
+  private carried = new Map<string, { t: number; o: number; c: number }>()
+  private holdFailed = holdFailedByDefault()
   private replay: Map<string, Array<{ result: any; agent: AgentState }>> | undefined
+  private continuable: Map<string, AgentState[]> | undefined
+  private retryNotes: Record<string, string> = {}
   private startedAt: number
   private resolveModelLabel: (m: ModelRef) => string
 
@@ -214,9 +270,10 @@ export class RunEngine {
     // (message ids are time-ordered, so the greatest id is the newest call;
     // a still-streaming message may report 0 until the provider fills it in,
     // so keep the previous non-zero context in that case)
-    let T = 0
-    let O = 0
-    let C = 0
+    const base = this.carried.get(agentId)
+    let T = base?.t ?? 0
+    let O = base?.o ?? 0
+    let C = base?.c ?? 0
     let newestId = ""
     let ctx = 0
     for (const [id, e] of per) {
@@ -350,6 +407,8 @@ export class RunEngine {
       if (prior.state.runId !== this.runId) throw new Error(`resume: engine runId ${this.runId} does not match prior run ${prior.state.runId}`)
       opts = { ...opts, script: prior.script, scriptPath: undefined, name: undefined, args: opts.args ?? prior.state.args }
       this.replay = prior.replay
+      this.continuable = prior.continuable
+      this.retryNotes = opts.retryNotes ?? {}
       this.startedAt = prior.state.startedAt || this.startedAt
     }
     const parsed = this.resolveScript(opts)
@@ -384,7 +443,15 @@ export class RunEngine {
       this.state.scriptPath = prior.state.scriptPath
       this.state.resumedAt = Date.now()
       this.state.resumeCount = (prior.state.resumeCount ?? 0) + 1
-      this.logLine("log", `resumed (${prior.replayable} completed agent${prior.replayable === 1 ? "" : "s"} replay from the journal, the rest run again)`)
+      const cont = [...prior.continuable.values()].reduce((n, l) => n + l.length, 0)
+      const notes = Object.keys(this.retryNotes).length
+      this.logLine(
+        "log",
+        `resumed (${prior.replayable} completed agent${prior.replayable === 1 ? "" : "s"} replay from the journal` +
+          (cont ? `, ${cont} continue in their own session${cont === 1 ? "" : "s"}` : "") +
+          (notes ? `, ${notes} with a note from you` : "") +
+          ")",
+      )
       this.writeJournal({ type: "run-start", runId: this.runId, name: meta.name, agentEstimate: total, at: Date.now(), resumed: true, replayable: prior.replayable })
     } else {
       this.writeJournal({ type: "run-start", runId: this.runId, name: meta.name, agentEstimate: total, at: this.startedAt })
@@ -570,94 +637,180 @@ export class RunEngine {
       return hit.result
     }
 
+    // resuming: an earlier attempt of this same agent that did not finish but
+    // still has a session → continue there instead of starting over
+    const prior = this.takeContinuation(phaseTitle, label, agent.prompt)
+
     await this.acquireSem()
     try {
-      if (this.stopRequested) {
-        agent.status = "cancelled"
-        agent.error = "run stopped"
-        this.onAgentTerminal(agent)
-        return null
-      }
+      if (this.stopRequested) return this.cancel(agent, "run stopped")
       await this.waitIfPaused()
-      if (this.stopRequested) {
-        agent.status = "cancelled"
-        agent.error = "run stopped"
-        this.onAgentTerminal(agent)
-        return null
+      if (this.stopRequested) return this.cancel(agent, "run stopped")
+      if (this.stoppedAgents.has(id)) return this.cancel(agent, "stopped by user")
+      // paused before it even started (P on a queued agent)
+      if (this.pausedAgents.has(id)) {
+        const d = await this.holdForDecision(agent, "paused")
+        if (d.kind === "skip") return this.cancel(agent, "stopped by user")
       }
       agent.status = "running"
       agent.startedAt = Date.now()
       this.markDirty()
 
-      const session = unwrap(await this.deps.client.session.create({
-        body: { parentID: this.deps.mainSessionID, title: `wf/${this.state.name}/${label}` },
-      }))
-      agent.sessionId = session.id
-      this.sessionToAgent.set(session.id, id)
-      this.deps.onChildSession?.(id, session.id)
+      // --- session: the agent's own earlier one (resume) or a fresh one -----
+      let sessionId: string | undefined
+      let followUp: FollowUp | undefined
+      if (prior) {
+        const note = this.retryNotes[prior.id]
+        if (await this.sessionExists(prior.sessionId!)) {
+          sessionId = prior.sessionId
+          agent.continued = true
+          agent.startedAt = prior.startedAt ?? agent.startedAt
+          agent.attempts = prior.attempts ?? 0
+          agent.toolCalls = prior.toolCalls || 0
+          agent.activity = Array.isArray(prior.activity) ? prior.activity : []
+          agent.liveFeed = Array.isArray(prior.liveFeed) ? prior.liveFeed : undefined
+          agent.tokens = prior.tokens || 0
+          agent.outputTokens = prior.outputTokens || 0
+          agent.contextTokens = prior.contextTokens || 0
+          agent.cost = prior.cost || 0
+          this.carried.set(id, { t: agent.tokens, o: agent.outputTokens, c: agent.cost })
+          const reason =
+            prior.status === "failed" ? prior.error : prior.status === "paused" ? "you were paused by the user" : "the run was interrupted"
+          followUp = { reason, note, fresh: false }
+          this.logLine("log", `${label}: continuing its earlier session${note ? " with your note" : ""}`)
+        } else {
+          followUp = note ? { note, fresh: true } : undefined
+          this.logLine("log", `${label}: earlier session is gone; starting over${note ? " with your note" : ""}`)
+        }
+        if (note) agent.retryNote = note
+      }
+      if (!sessionId) {
+        const session = unwrap(await this.deps.client.session.create({
+          body: { parentID: this.deps.mainSessionID, title: `wf/${this.state.name}/${label}` },
+        }))
+        sessionId = session.id as string
+      }
+      agent.sessionId = sessionId
+      this.sessionToAgent.set(sessionId, id)
+      this.deps.onChildSession?.(id, sessionId)
 
-      let attempts = opts.schema ? 2 : 1
-      let lastFailure = ""
-      for (let attempt = 0; attempt < attempts; attempt++) {
+      // --- attempt loop -------------------------------------------------------
+      // Every prompt goes to the same session, so a retry (automatic or by the
+      // user) never throws away the work the agent already did.
+      const maxAuto = opts.schema ? 2 : 1
+      let autoAttempts = 0
+      for (;;) {
+        // a decision that arrived while the agent was between prompts
+        const early = this.decisions.get(id)
+        if (this.stoppedAgents.has(id) || early?.kind === "skip") {
+          this.decisions.delete(id)
+          return this.cancel(agent, "stopped by user")
+        }
+        if (early?.kind === "retry") {
+          this.decisions.delete(id)
+          followUp = { reason: followUp?.reason, note: early.note ?? followUp?.note, fresh: false }
+          if (early.note) agent.retryNote = early.note
+        }
+        if (this.pausedAgents.has(id)) {
+          const d = await this.holdForDecision(agent, "paused")
+          if (d.kind === "skip") return this.cancel(agent, "stopped by user")
+          followUp = { reason: "you were paused by the user", note: d.note, fresh: false }
+          if (d.note) agent.retryNote = d.note
+          agent.status = "running"
+          this.markDirty()
+        }
+
+        agent.attempts = (agent.attempts ?? 0) + 1
         const body: any = {
-          parts: [{ type: "text", text: this.subagentPrompt(prompt, phaseTitle, opts, attempt, lastFailure) }],
+          parts: [{ type: "text", text: this.subagentPrompt(prompt, phaseTitle, opts, followUp) }],
         }
         if (model) body.model = { providerID: model.providerID, modelID: model.modelID }
-        const res = unwrap(await this.deps.client.session.prompt({ path: { id: session.id }, body }))
+        const res = unwrap(await this.deps.client.session.prompt({ path: { id: sessionId }, body }))
         const info = res?.info
         if (!info) throw new Error("empty session response")
         this.recordMessage(info)
         if (info.time?.completed) agent.endedAt = info.time.completed
         this.recount()
         this.markDirty()
+
+        // interrupted on purpose (P / X / R while it was running)?
+        if (this.stoppedAgents.has(id)) return this.cancel(agent, "stopped by user")
+        if (this.pausedAgents.has(id) || this.decisions.has(id)) continue
+
+        let failure: string | undefined
         if (info.error) {
-          throw new Error(typeof info.error === "string" ? info.error : info.error?.message ?? JSON.stringify(info.error))
+          failure = typeof info.error === "string" ? info.error : info.error?.message ?? JSON.stringify(info.error)
+        } else {
+          const text = finalText(res?.parts)
+          if (!opts.schema) {
+            agent.outcomeText = truncate(text, 4000)
+            return this.terminate(agent, "completed", text)
+          }
+          const ex = extractJson(text)
+          if (!ex.ok) {
+            failure = `previous response was not valid JSON: ${ex.error}`
+            agent.activity.push({ tool: "StructuredOutput", title: "invalid output", preview: ex.error, startedAt: Date.now(), endedAt: Date.now() })
+          } else {
+            try {
+              validateSchema(ex.value, opts.schema)
+              agent.outcome = ex.value
+              agent.outcomeText = truncate(JSON.stringify(ex.value, null, 2), 4000)
+              return this.terminate(agent, "completed", ex.value)
+            } catch (e: any) {
+              failure = `previous JSON failed schema validation: ${e?.message ?? e}`
+            }
+          }
         }
-        const text = finalText(res?.parts)
-        if (!opts.schema) {
-          agent.outcomeText = truncate(text, 4000)
-          return this.terminate(agent, "completed", text)
-        }
-        const ex = extractJson(text)
-        if (!ex.ok) {
-          lastFailure = `previous response was not valid JSON: ${ex.error}`
-          agent.activity.push({ tool: "StructuredOutput", title: "invalid output", preview: ex.error, startedAt: Date.now(), endedAt: Date.now() })
+
+        // failed attempt: retry on our own first, then ask the user
+        autoAttempts++
+        if (autoAttempts < maxAuto) {
+          followUp = { reason: failure, fresh: false }
           this.markDirty()
           continue
         }
-        try {
-          validateSchema(ex.value, opts.schema)
-          agent.outcome = ex.value
-          agent.outcomeText = truncate(JSON.stringify(ex.value, null, 2), 4000)
-          return this.terminate(agent, "completed", ex.value)
-        } catch (e: any) {
-          lastFailure = `previous JSON failed schema validation: ${e?.message ?? e}`
-          continue
-        }
-      }
-      agent.status = "failed"
-      agent.error = `structured output failed after ${attempts} attempts (${lastFailure})`
-      this.onAgentTerminal(agent)
-      this.writeJournal({ type: "agent-done", id, status: "failed", error: agent.error, at: Date.now() })
-      return null
-    } catch (e: any) {
-      if (this.stopRequested || (e instanceof RunAbortedError)) {
-        agent.status = "cancelled"
-        agent.error = "run stopped"
-      } else {
         agent.status = "failed"
-        agent.error = errText(e)
+        agent.error = opts.schema && !info.error ? `structured output failed after ${agent.attempts} attempts (${failure})` : failure
+        agent.endedAt = Date.now()
+        this.writeJournal({ type: "agent-done", id, status: "failed", error: agent.error, at: Date.now() })
+        if (!this.holdFailed || this.stopRequested) {
+          this.onAgentTerminal(agent)
+          return null
+        }
+        const d = await this.holdForDecision(agent, "failed")
+        if (d.kind === "skip") {
+          this.onAgentTerminal(agent)
+          return null
+        }
+        followUp = { reason: agent.error, note: d.note, fresh: false }
+        if (d.note) agent.retryNote = d.note
+        agent.status = "running"
+        agent.error = undefined
+        agent.endedAt = undefined
+        autoAttempts = 0
+        this.markDirty()
       }
+    } catch (e: any) {
+      if (this.stopRequested || e instanceof RunAbortedError) return this.cancel(agent, "run stopped")
+      if (this.stoppedAgents.has(id)) return this.cancel(agent, "stopped by user")
+      agent.status = "failed"
+      agent.error = errText(e)
+      agent.endedAt = Date.now()
       this.onAgentTerminal(agent)
       this.writeJournal({ type: "agent-done", id, status: agent.status, error: agent.error, at: Date.now() })
       return null
     } finally {
       this.releaseSem()
+      this.stoppedAgents.delete(id)
+      this.pausedAgents.delete(id)
+      this.decisions.delete(id)
     }
   }
 
   private terminate(agent: AgentState, status: AgentStatus, value: any): any {
     agent.status = status
+    agent.held = false
+    agent.error = undefined
     agent.endedAt = Date.now()
     this.onAgentTerminal(agent)
     this.writeJournal({
@@ -670,6 +823,60 @@ export class RunEngine {
     return value
   }
 
+  /** the agent is over without a result; the script gets null */
+  private cancel(agent: AgentState, reason: string): null {
+    agent.status = "cancelled"
+    agent.held = false
+    agent.error = reason
+    agent.endedAt = Date.now()
+    this.onAgentTerminal(agent)
+    this.writeJournal({ type: "agent-done", id: agent.id, status: "cancelled", error: reason, at: Date.now() })
+    return null
+  }
+
+  /**
+   * The script keeps waiting for this agent while the user decides: R retries
+   * in the same session (optionally with a note), X skips. The concurrency
+   * slot is given back meanwhile so other agents are not starved. A run-level
+   * stop resolves as skip.
+   */
+  private async holdForDecision(agent: AgentState, why: "failed" | "paused"): Promise<Decision> {
+    if (why === "paused") {
+      agent.status = "paused"
+      agent.error = undefined
+    }
+    agent.held = true
+    this.recount()
+    this.logLine("log", why === "failed" ? `${agent.label} failed — R retries in its session, X skips` : `${agent.label} paused — P resumes, R retries with a note, X stops`)
+    this.releaseSem()
+    let d: Decision | undefined
+    try {
+      while (!(d = this.decisions.get(agent.id)) && !this.stopRequested && !this.stoppedAgents.has(agent.id)) {
+        await sleep(300)
+      }
+      this.decisions.delete(agent.id)
+    } finally {
+      await this.acquireSem()
+    }
+    this.pausedAgents.delete(agent.id)
+    agent.held = false
+    if (!d || this.stopRequested || this.stoppedAgents.has(agent.id)) return { kind: "skip" }
+    if (d.kind === "retry") this.logLine("log", `${agent.label}: ${why === "paused" ? "resumed" : "retry"}${d.note ? " with your note" : ""}`)
+    return d
+  }
+
+  private async sessionExists(sessionId: string): Promise<boolean> {
+    const get = this.deps.client.session.get
+    if (!get) return true
+    try {
+      const info = unwrap(await get.call(this.deps.client.session, { path: { id: sessionId } }))
+      if (!info || typeof info !== "object" || info.error) return false
+      return typeof info.id !== "string" || info.id === sessionId
+    } catch {
+      return false
+    }
+  }
+
   /** pop the next journaled result for this (phase, label, prompt), if resuming */
   private takeReplay(phase: string, label: string, prompt: string): { result: any; agent: AgentState } | undefined {
     if (!this.replay) return undefined
@@ -678,7 +885,16 @@ export class RunEngine {
     return list.shift()
   }
 
-  private onAgentTerminal(_agent: AgentState): void {
+  /** pop the next unfinished-but-resumable agent for this (phase, label, prompt), if resuming */
+  private takeContinuation(phase: string, label: string, prompt: string): AgentState | undefined {
+    if (!this.continuable) return undefined
+    const list = this.continuable.get(replayKey(phase, label, prompt))
+    if (!list?.length) return undefined
+    return list.shift()
+  }
+
+  private onAgentTerminal(agent: AgentState): void {
+    agent.held = false
     this.recount()
     this.markDirty()
   }
@@ -714,14 +930,27 @@ export class RunEngine {
 
   // --- prompting -------------------------------------------------------------
 
-  private subagentPrompt(prompt: string, phase: string, opts: AgentOpts, attempt: number, lastFailure: string): string {
+  /**
+   * First prompt: the task. Follow-up in the same session: what went wrong
+   * (and the user's note) plus the output contract again — the task itself is
+   * already in the conversation, so the agent continues instead of restarting.
+   */
+  private subagentPrompt(prompt: string, phase: string, opts: AgentOpts, followUp?: FollowUp): string {
     const parts: string[] = []
+    const same = followUp && !followUp.fresh
     parts.push(`You are a sub-agent of a workflow run (workflow "${this.state.name}", phase "${phase}").`)
-    parts.push("Your final message text is the machine return value of this task — treat it as data for the orchestrator, not a message to a human.")
-    parts.push("- Be concise and factual. No conversational preamble, no summaries of what you did.")
-    if (attempt > 0 && lastFailure) {
-      parts.push("")
-      parts.push(`IMPORTANT: your previous attempt was rejected — ${lastFailure}. This time respond correctly.`)
+    if (same) {
+      parts.push("This is a follow-up in the same session: your task is the TASK message earlier in this conversation.")
+      if (followUp.reason) parts.push(`Your previous attempt did not go through — ${followUp.reason}.`)
+      if (followUp.note) parts.push(`Note from the user: ${followUp.note}`)
+      parts.push("Continue from where you left off. Everything you already found in this session still counts; do not start over or repeat work.")
+    } else {
+      parts.push("Your final message text is the machine return value of this task — treat it as data for the orchestrator, not a message to a human.")
+      parts.push("- Be concise and factual. No conversational preamble, no summaries of what you did.")
+      if (followUp?.note) {
+        parts.push("")
+        parts.push(`Note from the user: ${followUp.note}`)
+      }
     }
     if (opts.schema) {
       parts.push("")
@@ -731,9 +960,11 @@ export class RunEngine {
       parts.push("")
       parts.push("Return the raw result text. If the result is code or JSON, a fenced block or bare value is fine.")
     }
-    parts.push("")
-    parts.push("--- TASK ---")
-    parts.push(prompt)
+    if (!same) {
+      parts.push("")
+      parts.push("--- TASK ---")
+      parts.push(prompt)
+    }
     return parts.join("\n")
   }
 
@@ -754,13 +985,17 @@ export class RunEngine {
       return
     }
     if (!ctl || typeof ctl !== "object") return
+    try {
+      rmSync(p, { force: true })
+    } catch {}
+    if (typeof ctl.agentId === "string" && ctl.agentId) {
+      this.controlAgent(ctl.agentId, String(ctl.action ?? ""), typeof ctl.note === "string" ? ctl.note.trim() || undefined : undefined)
+      return
+    }
     // accept both shapes: {"stop":true} and {"action":"stop"}
     const wantStop = ctl.stop === true || ctl.action === "stop"
     const wantPause = ctl.pause === true || ctl.action === "pause"
     const wantResume = ctl.resume === true || ctl.action === "resume"
-    try {
-      rmSync(p, { force: true })
-    } catch {}
     if (wantPause && !this.paused && !this.stopRequested) {
       this.paused = true
       this.state.status = "paused"
@@ -782,13 +1017,74 @@ export class RunEngine {
     }
   }
 
+  /**
+   * One agent, by the user: pause (abort, keep the session), resume, retry
+   * (continue in the same session with the last error and an optional note),
+   * stop (abort and hand null to the script).
+   */
+  private controlAgent(id: string, action: string, note?: string): void {
+    const a = this.state.agents[id]
+    if (!a) {
+      this.logLine("log", `no agent ${id} in this run`)
+      return
+    }
+    if (this.stopRequested) return
+    const live = a.status === "running" || a.status === "queued"
+    const waiting = !!a.held
+    switch (action) {
+      case "pause":
+        if (!live) {
+          this.logLine("log", `${a.label} is ${a.status}; nothing to pause`)
+          return
+        }
+        this.pausedAgents.add(id)
+        this.abortAgent(a)
+        this.logLine("log", `${a.label}: pause requested`)
+        break
+      case "resume":
+      case "retry":
+        if (waiting || live) {
+          this.decisions.set(id, { kind: "retry", note })
+          if (a.status === "running") {
+            // steer a running agent: interrupt it, the loop continues with the note
+            this.abortAgent(a)
+            this.logLine("log", `${a.label}: interrupted, continues${note ? " with your note" : ""}`)
+          }
+        } else if (a.status === "completed") {
+          this.logLine("log", `${a.label} already completed; retry it after the run ends (R on the run)`)
+        } else {
+          this.logLine("log", `${a.label}: the script already received null for it; retry after the run ends (R resumes the run)`)
+        }
+        break
+      case "stop":
+      case "skip":
+        if (!live && !waiting) {
+          this.logLine("log", `${a.label} is already ${a.status}`)
+          return
+        }
+        this.stoppedAgents.add(id)
+        this.decisions.set(id, { kind: "skip" })
+        if (a.status === "running") this.abortAgent(a)
+        this.logLine("log", `${a.label}: stop requested (the script gets null)`)
+        break
+      default:
+        this.logLine("log", `unknown agent action "${action}"`)
+    }
+    this.markDirty()
+  }
+
+  private abortAgent(a: AgentState): void {
+    if (!a.sessionId) return
+    this.deps.client.session
+      .abort({ path: { id: a.sessionId } })
+      .catch(() => {})
+  }
+
   private abortAll(): void {
     for (const a of Object.values(this.state.agents)) {
       if (a.status === "running" && a.sessionId) {
         this.stoppedAgents.add(a.id)
-        this.deps.client.session
-          .abort({ path: { id: a.sessionId } })
-          .catch(() => {})
+        this.abortAgent(a)
       }
     }
   }
@@ -828,12 +1124,12 @@ export class RunEngine {
     for (const p of this.state.phases) {
       p.done = p.agentIds.filter((id) => {
         const a = this.state.agents[id]
-        return a && a.status !== "queued" && a.status !== "running"
+        return a && isSettled(a)
       }).length
     }
     const agents = Object.values(this.state.agents)
     this.state.agentCount = agents.length
-    this.state.agentDone = agents.filter((a) => a.status !== "queued" && a.status !== "running").length
+    this.state.agentDone = agents.filter((a) => isSettled(a)).length
     this.state.totalTokens = agents.reduce((s, a) => s + (a.tokens || 0), 0)
     this.state.totalContextTokens = agents.reduce((s, a) => s + (a.contextTokens || 0), 0)
     this.state.totalCost = agents.reduce((s, a) => s + (a.cost || 0), 0)
@@ -905,11 +1201,13 @@ export class RunEngine {
     this.stopRequested = true
     this.abortAll()
     for (const a of Object.values(this.state.agents)) {
-      if (a.status === "running" || a.status === "queued") {
+      if (a.status === "running" || a.status === "queued" || a.status === "paused") {
         a.status = "cancelled"
         a.error = reason
         a.endedAt = Date.now()
       }
+      // a held failure keeps its error; the session stays and continues on resume
+      a.held = false
     }
     this.recount()
     this.state.status = "stopped"
