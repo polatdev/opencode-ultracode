@@ -153,6 +153,39 @@ export interface RunState {
   resumedAt?: number
   /** how many times the run has been resumed */
   resumeCount?: number
+  /** pid of the process driving this run — lets a reader PROVE the engine is gone */
+  enginePid?: number
+  /** host that `enginePid` is valid on; a pid from another host says nothing */
+  engineHost?: string
+  /** wall clock of the last write by a live engine (heartbeats every ~2s) */
+  heartbeatAt?: number
+}
+
+/** the engine heartbeats state.json every ~2s; a live run whose heartbeat is
+ *  this old is *suspected* dead (only the pid check can confirm it) */
+export const STALE_AFTER_MS = 20_000
+
+/**
+ * Is the process that drives this run still there?
+ * - "alive"/"dead" come from the recorded pid (proof, same host only)
+ * - "unknown" means we can only guess from the heartbeat age — a long-blocked
+ *   engine and a crashed one look the same, so callers must not treat a stale
+ *   heartbeat alone as a death certificate.
+ */
+export function engineLiveness(
+  state: Pick<RunState, "enginePid" | "engineHost" | "heartbeatAt" | "startedAt">,
+  now: number,
+  env: { hostname: string; pidAlive: (pid: number) => boolean | undefined },
+): "alive" | "dead" | "unknown" {
+  const pid = state.enginePid
+  if (pid && pid > 0 && (!state.engineHost || state.engineHost === env.hostname)) {
+    const alive = env.pidAlive(pid)
+    if (alive === true) return "alive"
+    if (alive === false) return "dead"
+  }
+  const beat = state.heartbeatAt ?? state.startedAt
+  if (beat && now - beat <= STALE_AFTER_MS) return "alive"
+  return "unknown"
 }
 
 /**

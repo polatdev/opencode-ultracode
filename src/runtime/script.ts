@@ -28,19 +28,11 @@ export function parseScript(script: string): ParsedScript {
   if (!m || m.index === undefined) throw new Error("Workflow script must start with `export const meta = { ... }`")
   const start = script.indexOf("{", m.index + m[0].length)
   if (start === -1) throw new Error("Could not find meta object literal")
-  const end = findBalanced(script, start)
-  const literal = script.slice(start, end + 1)
-  // meta must be a pure literal; evaluating an object literal with new Function
-  // is safe as long as it contains no expressions — we lint that first.
-  if (/[;,\n]\s*function\b|\bnew\s+|\bif\s*\(|\bwhile\s*\(|=>/.test(literal))
-    throw new Error("meta must be a pure object literal (no functions, calls, or arrow functions)")
-  let meta: WorkflowMeta
-  try {
-    meta = new Function(`"use strict"; return (${literal})`)() as WorkflowMeta
-  } catch (e: any) {
-    throw new Error(`Invalid meta literal: ${e?.message ?? e}`)
-  }
-  if (!meta || typeof meta !== "object") throw new Error("meta must be an object")
+  // meta is parsed, never evaluated: the parser accepts ONLY literal syntax, so
+  // purity is guaranteed by construction and every rejection points at an offset.
+  const { value, end } = parseMetaLiteral(script, start)
+  const meta = value as WorkflowMeta
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) throw new Error("meta must be an object")
   if (!meta.name || typeof meta.name !== "string") throw new Error("meta.name is required")
   if (!meta.description || typeof meta.description !== "string")
     throw new Error("meta.description is required (one line, shown in the approval dialog)")
@@ -51,24 +43,175 @@ export function parseScript(script: string): ParsedScript {
   return { meta, body }
 }
 
-function findBalanced(s: string, openIdx: number): number {
-  let depth = 0
-  let inStr: string | null = null
-  for (let i = openIdx; i < s.length; i++) {
-    const c = s[i]
-    if (inStr) {
-      if (c === "\\") i++
-      else if (c === inStr) inStr = null
-      continue
-    }
-    if (c === '"' || c === "'" || c === "`") inStr = c
-    else if (c === "{" || c === "[" || c === "(") depth++
-    else if (c === "}" || c === "]" || c === ")") {
-      depth--
-      if (depth === 0) return i
+// --- meta literal parser ------------------------------------------------------
+//
+// A recursive-descent parser for the pure-literal subset meta is allowed to use:
+// objects, arrays, quoted strings, numbers, true/false/null (trailing commas and
+// comments permitted). Anything else — a call, an identifier reference, a template
+// string, an operator — is a parse error with an exact position, instead of a
+// regex that lets `description: f()` through and blows up later at eval time.
+
+const IDENT_RE = /[A-Za-z_$][A-Za-z0-9_$]*/y
+
+export function parseMetaLiteral(src: string, start: number): { value: unknown; end: number } {
+  let i = start
+
+  const fail = (msg: string, at = i): never => {
+    const line = src.slice(0, at).split("\n").length
+    const col = at - (src.lastIndexOf("\n", at - 1) + 1) + 1
+    const near = src.slice(at, at + 24).split("\n")[0]
+    throw new Error(`meta must be a pure object literal — ${msg} at line ${line}:${col}${near ? ` near \`${near}\`` : ""}`)
+  }
+
+  const skip = () => {
+    for (;;) {
+      while (i < src.length && /\s/.test(src[i])) i++
+      if (src[i] === "/" && src[i + 1] === "/") {
+        const nl = src.indexOf("\n", i)
+        i = nl === -1 ? src.length : nl + 1
+      } else if (src[i] === "/" && src[i + 1] === "*") {
+        const close = src.indexOf("*/", i + 2)
+        if (close === -1) fail("unterminated comment")
+        i = close + 2
+      } else return
     }
   }
-  throw new Error("Unbalanced meta literal")
+
+  const parseString = (): string => {
+    const quote = src[i]
+    if (quote === "`") fail("template strings are not allowed (meta must be static)")
+    i++
+    let out = ""
+    while (i < src.length) {
+      const c = src[i]
+      if (c === "\\") {
+        const e = src[i + 1]
+        const simple: Record<string, string> = { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v", "0": "\0" }
+        if (e === "u") {
+          const hex = src.slice(i + 2, i + 6)
+          if (!/^[0-9a-fA-F]{4}$/.test(hex)) fail("invalid \\u escape")
+          out += String.fromCharCode(parseInt(hex, 16))
+          i += 6
+        } else if (e === "x") {
+          const hex = src.slice(i + 2, i + 4)
+          if (!/^[0-9a-fA-F]{2}$/.test(hex)) fail("invalid \\x escape")
+          out += String.fromCharCode(parseInt(hex, 16))
+          i += 4
+        } else if (e === "\n") {
+          i += 2
+        } else {
+          out += simple[e] ?? e
+          i += 2
+        }
+        continue
+      }
+      if (c === quote) {
+        i++
+        return out
+      }
+      if (c === "\n") fail("unterminated string")
+      out += c
+      i++
+    }
+    return fail("unterminated string")
+  }
+
+  const parseValue = (): unknown => {
+    skip()
+    const c = src[i]
+    if (c === undefined) return fail("unexpected end of meta literal")
+    if (c === '"' || c === "'" || c === "`") return parseString()
+    if (c === "{") return parseObject()
+    if (c === "[") return parseArray()
+    if (c === "-" || c === "+" || (c >= "0" && c <= "9")) {
+      const num = /[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/y
+      num.lastIndex = i
+      const m2 = num.exec(src)
+      if (!m2 || m2.index !== i) return fail("invalid number")
+      i += m2[0].length
+      return Number(m2[0])
+    }
+    IDENT_RE.lastIndex = i
+    const word = IDENT_RE.exec(src)
+    if (word && word.index === i) {
+      const w = word[0]
+      if (w === "true" || w === "false" || w === "null" || w === "undefined") {
+        i += w.length
+        skip()
+        if (src[i] === "(") return fail(`\`${w}\` is not callable here; meta values must be literals`, i)
+        return w === "true" ? true : w === "false" ? false : null
+      }
+      return fail(`\`${w}\` is not a literal — meta values must be strings, numbers, booleans, null, arrays or objects`)
+    }
+    return fail("unexpected token")
+  }
+
+  const parseArray = (): unknown[] => {
+    i++ // [
+    const out: unknown[] = []
+    for (;;) {
+      skip()
+      if (src[i] === "]") {
+        i++
+        return out
+      }
+      if (i >= src.length) return fail("unterminated array")
+      out.push(parseValue())
+      skip()
+      if (src[i] === ",") {
+        i++
+        continue
+      }
+      if (src[i] === "]") {
+        i++
+        return out
+      }
+      return fail("expected `,` or `]`")
+    }
+  }
+
+  const parseObject = (): Record<string, unknown> => {
+    i++ // {
+    const out: Record<string, unknown> = {}
+    for (;;) {
+      skip()
+      if (src[i] === "}") {
+        i++
+        return out
+      }
+      if (i >= src.length) return fail("unterminated object")
+      if (src[i] === "." || src[i] === "[") return fail("computed or spread keys are not allowed in meta")
+      let key: string
+      if (src[i] === '"' || src[i] === "'" || src[i] === "`") key = parseString()
+      else {
+        IDENT_RE.lastIndex = i
+        const k = IDENT_RE.exec(src)
+        if (!k || k.index !== i) return fail("expected a property name")
+        key = k[0]
+        i += key.length
+      }
+      skip()
+      if (src[i] === "(") return fail(`\`${key}(...)\` is a method — meta must contain no functions`, i)
+      if (src[i] !== ":") return fail(`expected \`:\` after property \`${key}\``)
+      i++
+      out[key] = parseValue()
+      skip()
+      if (src[i] === ",") {
+        i++
+        continue
+      }
+      if (src[i] === "}") {
+        i++
+        return out
+      }
+      return fail("expected `,` or `}`")
+    }
+  }
+
+  skip()
+  if (src[i] !== "{") fail("meta must be an object literal")
+  const value = parseObject()
+  return { value, end: i - 1 }
 }
 
 // --- sandbox ----------------------------------------------------------------

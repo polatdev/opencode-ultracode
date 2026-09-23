@@ -10,7 +10,7 @@
 import { batch, createMemo, createSignal } from "solid-js"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2"
-import type { AgentState, RunState } from "../shared/state.ts"
+import { isSettled, type AgentState, type RunState } from "../shared/state.ts"
 
 export type PendingRequest =
   | { kind: "permission"; id: string; sessionID: string; at: number; req: PermissionRequest }
@@ -149,8 +149,16 @@ export function createRequestStore(api: TuiPluginApi, onDispose: (fn: () => void
   })
 
   const forSession = (sessionID: string | undefined): PendingRequest[] => (sessionID ? bySession().get(sessionID) ?? [] : [])
+  /**
+   * An agent blocks on a permission prompt whenever its session is still open —
+   * which includes queued, paused and held agents, not just "running" ones.
+   * Filtering on status === "running" hid exactly the deadlock the operator
+   * opened /workflows to find. Settled agents (terminal and not held) are
+   * excluded: their sessions were aborted, so any request there is stale.
+   */
+  const blocksOnRequests = (a: AgentState | undefined): a is AgentState => !!a && !!a.sessionId && !isSettled(a)
   const forAgent = (agent: AgentState | undefined): PendingRequest[] => {
-    if (!agent || agent.status !== "running") return []
+    if (!blocksOnRequests(agent)) return []
     return forSession(agent.sessionId)
   }
 
@@ -181,7 +189,7 @@ export function createRequestStore(api: TuiPluginApi, onDispose: (fn: () => void
       const out: AgentState[] = []
       for (const id of run.agentOrder) {
         const a = run.agents[id]
-        if (a && a.status === "running" && a.sessionId && sessions.has(a.sessionId)) out.push(a)
+        if (blocksOnRequests(a) && sessions.has(a.sessionId!)) out.push(a)
       }
       return out
     },

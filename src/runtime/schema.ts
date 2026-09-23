@@ -22,11 +22,13 @@ export function validateSchema(value: unknown, schema: unknown, path = "$"): voi
     for (const [key, sub] of Object.entries<any>(s.properties ?? {})) {
       if (key in obj) validateSchema(obj[key], sub, `${path}.${key}`)
     }
-    if (s.additionalProperties === false && s.required) {
-      const allowed = new Set(s.required)
-      for (const k of Object.keys(obj)) if (!allowed.has(k)) {
-        // only reject when properties are also defined, to stay permissive
-        if (s.properties) throw new SchemaError(`${path}.${k}: additional property not allowed`)
+    if (s.additionalProperties === false && s.properties) {
+      // Allowed = every declared property (optional ones included), plus anything
+      // listed in required. Building this set from `required` alone would reject
+      // valid optional properties.
+      const allowed = new Set<string>([...Object.keys(s.properties), ...(s.required ?? [])])
+      for (const k of Object.keys(obj)) {
+        if (!allowed.has(k)) throw new SchemaError(`${path}.${k}: additional property not allowed`)
       }
     }
   }

@@ -8,7 +8,8 @@ import { join } from "node:path"
 import { batch, createMemo, createSignal } from "solid-js"
 import { createStore as createSolidStore, reconcile } from "solid-js/store"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { controlPath, runsRoot, workflowRoot, type RunState } from "../shared/state.ts"
+import { hostname } from "node:os"
+import { controlPath, engineLiveness, runsRoot, workflowRoot, STALE_AFTER_MS, type RunState } from "../shared/state.ts"
 
 export interface WorkflowStore {
   /** all runs, newest first (fine-grained proxies — read fields inside JSX) */
@@ -57,9 +58,22 @@ export function isLive(status: string | undefined): boolean {
   return status === "running" || status === "paused" || status === "pending"
 }
 
-/** the engine heartbeats state.json every ~2s; a live run whose file is
- *  this old has lost its engine (opencode crashed or was closed) */
-export const STALE_AFTER_MS = 20_000
+export { STALE_AFTER_MS }
+
+const HOST = hostname()
+
+/** does this pid still exist? signal 0 checks without touching the process.
+ *  undefined = we cannot tell (e.g. EPERM: it exists but isn't ours). */
+function pidAlive(pid: number): boolean | undefined {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e: any) {
+    if (e?.code === "ESRCH") return false
+    if (e?.code === "EPERM") return true
+    return undefined
+  }
+}
 
 export function createStore(api: TuiPluginApi, onDispose?: (fn: () => void) => void): WorkflowStore {
   const root = () => api.state.path.worktree || api.state.path.directory
@@ -215,10 +229,17 @@ export function createStore(api: TuiPluginApi, onDispose?: (fn: () => void) => v
     now,
     spinner: () => SPINNER[frame()] ?? SPINNER[0],
     size,
+    // "stale" means the engine is GONE, which is what unlocks the resume path —
+    // so prove it with the recorded pid where we can, and only fall back to the
+    // heartbeat age (plus our own observation of the file) when we cannot.
     isStale: (run) => {
       if (!isLive(run.status)) return false
+      const liveness = engineLiveness(run, now(), { hostname: HOST, pidAlive })
+      if (liveness === "alive") return false
+      if (liveness === "dead") return true
       const at = written()[run.runId]
-      return at != null && now() - at > STALE_AFTER_MS
+      const beat = run.heartbeatAt ?? at
+      return beat != null && now() - beat > STALE_AFTER_MS
     },
 
     runsDir,

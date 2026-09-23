@@ -7,6 +7,8 @@ import { join } from "node:path"
 import assert from "node:assert"
 import { generateRunId, loadPriorRun, RunEngine } from "./engine.ts"
 import { parseScript } from "./script.ts"
+import { validateSchema } from "./schema.ts"
+import { engineLiveness } from "../shared/state.ts"
 
 const tmp = mkdtempSync(join(tmpdir(), "wf-selftest-"))
 const opencodeDir = join(tmp, ".opencode")
@@ -126,11 +128,55 @@ async function main() {
 
   const bad = () => parseScript("const meta = { name: 'x' };\nagent('hi')")
   assert.throws(bad, /must start with/)
-  const impure = `export const meta = { name: "x", description: f() };\nphase("a")`
-  // f() is a call — our lint only bans functions/new/if/while/arrow; a plain call() would pass lint
-  // and blow up at eval time: still an error either way
-  assert.throws(() => parseScript(impure), /meta|moust|literal|name|description/i)
-  console.log("  ok: invalid scripts rejected")
+  // meta is PARSED, not evaluated: every impure form is rejected up front with a
+  // position, instead of slipping past a regex and blowing up at eval time
+  const impure: Array<[string, RegExp]> = [
+    [`export const meta = { name: "x", description: f() };\nphase("a")`, /`f` is not a literal.*line 1:/],
+    [`export const meta = { name: "x", description: NAME };\nphase("a")`, /`NAME` is not a literal/],
+    [`export const meta = { name: "x", description: \`hi \${x}\` };\nphase("a")`, /template strings are not allowed/],
+    [`export const meta = { name: "x", go() { return 1 } };\nphase("a")`, /`go\(\.\.\.\)` is a method/],
+    [`export const meta = { name: "x", description: "a" + "b" };\nphase("a")`, /expected `,` or `}`/],
+    [`export const meta = { name: "x", ...rest };\nphase("a")`, /computed or spread keys/],
+    [`export const meta = { name: "x", description: () => 1 };\nphase("a")`, /pure object literal/],
+  ]
+  for (const [src, re] of impure) {
+    assert.throws(() => parseScript(src), re, `should reject: ${src.split("\n")[0]}`)
+  }
+  // ...while every legal literal form still parses, comments and trailing commas included
+  const ok = parseScript(
+    `export const meta = {
+  name: "x", // the name
+  description: 'it\\'s fine',
+  /* block */ whenToUse: "later",
+  phases: [{ title: "A", detail: "d" }, { title: "B" },],
+}
+phase("A")`,
+  )
+  assert.equal(ok.meta.name, "x")
+  assert.equal(ok.meta.description, "it's fine")
+  assert.equal(ok.meta.phases?.length, 2)
+  assert.ok(ok.body.includes('phase("A")') && !/export\s+const\s+meta/.test(ok.body))
+  console.log(`  ok: invalid scripts rejected (${impure.length} impure forms), literals + comments accepted`)
+
+  // ---- test 1b: schema validation ------------------------------------------
+  console.log("test 1b: additionalProperties:false keeps declared-but-optional properties")
+  {
+    const schema = {
+      type: "object",
+      properties: { a: { type: "string" }, b: { type: "number" }, note: { type: "string" } },
+      required: ["a"],
+      additionalProperties: false,
+    }
+    validateSchema({ a: "x" }, schema)
+    validateSchema({ a: "x", b: 2, note: "opt" }, schema) // optional, declared → must pass
+    assert.throws(() => validateSchema({ a: "x", other: 1 }, schema), /additional property not allowed/)
+    assert.throws(() => validateSchema({ b: 2 }, schema), /missing required property "a"/)
+    // additionalProperties:false with no `required` at all must still be enforced
+    const noReq = { type: "object", properties: { a: { type: "string" } }, additionalProperties: false }
+    validateSchema({ a: "x" }, noReq)
+    assert.throws(() => validateSchema({ a: "x", z: 1 }, noReq), /additional property not allowed/)
+    console.log("  ok: optional properties accepted, undeclared ones rejected")
+  }
 
   // ---- test 2: full demo run ----------------------------------------------
   console.log("test 2: full demo-fanout run (4 agents)")
@@ -174,6 +220,19 @@ async function main() {
     "run context = sum of agent contexts",
   )
   console.log(`  ok: state.json (4 agents, 2 phases, billed=${state.totalTokens}, context=${state.totalContextTokens})`)
+
+  // liveness: the run records who drove it, so a reader can prove life/death
+  assert.equal(state.enginePid, process.pid, "engine pid recorded")
+  assert.ok(state.engineHost, "engine host recorded")
+  assert.ok(state.heartbeatAt >= state.startedAt, "heartbeat recorded")
+  const env = (alive: boolean | undefined) => ({ hostname: state.engineHost, pidAlive: () => alive })
+  assert.equal(engineLiveness(state, Date.now(), env(true)), "alive", "live pid wins over an old heartbeat")
+  assert.equal(engineLiveness(state, Date.now() + 3_600_000, env(true)), "alive", "a blocked engine is not declared dead")
+  assert.equal(engineLiveness(state, Date.now(), env(false)), "dead", "a gone pid is proof of death")
+  assert.equal(engineLiveness({ ...state, enginePid: undefined }, state.heartbeatAt + 1_000, env(undefined)), "alive", "fresh heartbeat, no pid → alive")
+  assert.equal(engineLiveness({ ...state, enginePid: undefined }, state.heartbeatAt + 60_000, env(undefined)), "unknown", "stale heartbeat alone is not proof")
+  assert.equal(engineLiveness({ ...state, engineHost: "some-other-host" }, state.heartbeatAt + 60_000, env(false)), "unknown", "a pid from another host says nothing")
+  console.log("  ok: engine liveness (pid proof, heartbeat fallback, unknown when unprovable)")
 
   // journal
   const journal = readFileSync(join(runsRoot, runId, "journal.jsonl"), "utf8").trim().split("\n")

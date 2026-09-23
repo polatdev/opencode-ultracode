@@ -3,8 +3,8 @@
 // writing to /tmp/opencode-workflows/<project>/<runId>/state.json, pause/stop control.
 
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync, existsSync, rmSync } from "node:fs"
-import { createHash } from "node:crypto"
-import { cpus } from "node:os"
+import { createHash, randomBytes } from "node:crypto"
+import { cpus, hostname } from "node:os"
 import { join } from "node:path"
 import {
   type AgentState,
@@ -127,6 +127,10 @@ export function loadPriorRun(runsRootDir: string, runId: string): PriorRun | und
     return undefined
   }
   if (!state || typeof state !== "object" || !state.agents || !script) return undefined
+  // The run directory IS the id. Older/copied state files can carry a different
+  // runId; pin it to the directory so the resume identity is derivable from disk
+  // and never depends on a value the caller happened to keep around.
+  state.runId = runId
   const results = new Map<string, any>()
   try {
     for (const line of readFileSync(journalPath(runsRootDir, runId), "utf8").split("\n")) {
@@ -184,9 +188,16 @@ interface ModelRef {
   label: string
 }
 
+/**
+ * Run ids are time-sortable and collision-free: a millisecond timestamp plus 40
+ * bits of CSPRNG entropy (Math.random gives no such guarantee, and two runs
+ * started in the same millisecond used to be able to land on the same id).
+ * The id is also recorded inside state.json as `runId`, so a resume can always
+ * be derived from the state file instead of an out-of-band value.
+ */
 export function generateRunId(): string {
-  const ts = Date.now().toString(36)
-  const rand = Math.random().toString(36).slice(2, 8)
+  const ts = Date.now().toString(36).padStart(9, "0")
+  const rand = randomBytes(5).toString("hex")
   return `run_${ts}${rand}`
 }
 
@@ -436,6 +447,11 @@ export class RunEngine {
       mainSessionID: this.deps.mainSessionID || undefined,
       defaultModel: this.deps.defaultModel,
       args: opts.args,
+      // liveness proof for readers (TUI): whoever finds this file can check the
+      // pid instead of guessing from the file's age
+      enginePid: process.pid,
+      engineHost: hostname(),
+      heartbeatAt: this.startedAt,
     }
     if (prior) {
       // keep the story of the run: earlier logs, then a marker for this resume
@@ -1148,6 +1164,13 @@ export class RunEngine {
   flushNow(): void {
     if (!this.state) return
     try {
+      // a terminal state keeps the heartbeat of its last live moment, so a
+      // reader can still tell "finished" from "engine vanished"
+      if (this.state.status === "running" || this.state.status === "pending" || this.state.status === "paused") {
+        this.state.heartbeatAt = Date.now()
+        this.state.enginePid = process.pid
+        this.state.engineHost = hostname()
+      }
       mkdirSync(this.runDir, { recursive: true })
       writeFileSync(statePath(this.deps.runsRoot, this.runId), JSON.stringify(this.state, null, 2))
     } catch (e: any) {
