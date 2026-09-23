@@ -231,9 +231,12 @@ export interface AgentOpts {
   phase?: string
   schema?: object
   model?: string
-  effort?: string
-  isolation?: string
+  /** opencode agent to run as (e.g. "general", "explore" or a configured agent); omit for the default */
   agentType?: string
+  /** not supported: accepted so a script does not crash, reported in the run log */
+  effort?: string
+  /** not supported: accepted so a script does not crash, reported in the run log */
+  isolation?: string
 }
 
 export interface Budget {

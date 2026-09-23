@@ -46,11 +46,17 @@ export const meta = {
   - `opts.phase` — assign to a progress group (use inside pipeline/parallel stages)
   - `opts.schema` — JSON Schema; the agent is forced to return a matching JSON object
   - `opts.model` — e.g. `'anthropic/claude-sonnet-4'`; omit to inherit the session model
+  - `opts.agentType` — opencode agent to run as: `'explore'` (read-only search), `'general'`,
+    or any agent from the project's config. Omit for the default agent. Sub-agents never get
+    the `workflow` tool, so a script cannot nest workflows.
 - `parallel(thunks)` → run `Array<() => Promise>` concurrently; BARRIER (awaits all).
   A throwing thunk yields `null` in the result array — the call never rejects.
 - `pipeline(items, stage1, stage2, ...)` → run each item through all stages INDEPENDENTLY,
   no barrier between stages. Stage callback receives `(prevResult, originalItem, index)`.
   A throwing stage drops that item to `null` and skips its remaining stages.
+  When more agents are requested than can run at once, a later stage gets the next
+  free slot before queued earlier-stage agents, so finished items flow through to the
+  end instead of waiting for every item to clear the first stage.
 - `phase(title)` → start a display phase; subsequent agents group under it.
 - `log(message)` → narrator line in /workflows.
 - `args` → value passed via the tool's `args` input (undefined if omitted).

@@ -653,6 +653,87 @@ return { r }
     }
   }
 
+  // ---- test 10: agentType → body.agent; sub-agents never get the workflow tool ----
+  console.log("test 10: agentType is passed as the opencode agent; workflow tool disabled for sub-agents")
+  {
+    const S10 = `
+export const meta = { name: "t10", description: "agent type", phases: [{ title: "A" }] }
+phase("A")
+const a = await agent("scan", { label: "scout", agentType: "explore" })
+const b = await agent("plain", { label: "plain", effort: "high" })
+return { a, b }
+`
+    const bodies: any[] = []
+    const client = {
+      session: {
+        async create(args: any) {
+          return { id: `ses_t10_${String(args.body?.title).split("/").pop()}` }
+        },
+        async prompt(args: any) {
+          bodies.push(args.body)
+          return { info: assistantMsg(args.path.id), parts: [{ type: "text", text: "done" }] }
+        },
+        async abort() {
+          return true
+        },
+      },
+    }
+    const rid = generateRunId()
+    const e = new RunEngine({ client: client as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set() }, rid)
+    const r = await e.run({ script: S10 })
+    assert.equal(r.status, "completed", r.error)
+    assert.equal(bodies.length, 2)
+    assert.equal(bodies[0].agent, "explore", "agentType goes out as body.agent")
+    assert.equal(bodies[1].agent, undefined, "no agentType → default agent")
+    for (const b of bodies) assert.strictEqual(b.tools?.workflow, false, "workflow tool is off for every sub-agent")
+    const s: any = JSON.parse(readFileSync(join(runsRoot, rid, "state.json"), "utf8"))
+    assert.ok(s.logs.some((l: any) => /plain: option "effort" is not supported/.test(l.message)), "unsupported option is reported, not dropped silently")
+    console.log("  ok: body.agent=explore, tools.workflow=false, effort reported")
+  }
+
+  // ---- test 11: pipeline stages flow — a later stage outranks queued earlier stages ----
+  console.log("test 11: pipeline: verify of item 1 starts before the last review is picked up")
+  {
+    const S11 = `
+export const meta = { name: "t11", description: "stage priority", phases: [{ title: "Review" }, { title: "Verify" }] }
+const items = ["a", "b", "c", "d", "e", "f"]
+const out = await pipeline(
+  items,
+  (_, f) => agent("review " + f, { label: "review:" + f, phase: "Review" }),
+  (r, f) => agent("verify " + f, { label: "verify:" + f, phase: "Verify" }),
+)
+return out
+`
+    const starts: string[] = []
+    const client = {
+      session: {
+        async create(args: any) {
+          return { id: `ses_t11_${String(args.body?.title).split("/").pop()}` }
+        },
+        async prompt(args: any) {
+          const task = String(args.body?.parts?.[0]?.text ?? "").split("--- TASK ---")[1]?.trim() ?? ""
+          starts.push(task)
+          await new Promise((r) => setTimeout(r, 15))
+          return { info: assistantMsg(args.path.id), parts: [{ type: "text", text: "ok " + task }] }
+        },
+        async abort() {
+          return true
+        },
+      },
+    }
+    const rid = generateRunId()
+    const e = new RunEngine({ client: client as any, opencodeDir, runsRoot, mainSessionID: "ses_main", availableModels: new Set(), concurrency: 2 }, rid)
+    const r = await e.run({ script: S11 })
+    assert.equal(r.status, "completed", r.error)
+    assert.equal(starts.length, 12)
+    const firstVerify = starts.findIndex((t) => t.startsWith("verify"))
+    const lastReview = starts.length - 1 - [...starts].reverse().findIndex((t) => t.startsWith("review"))
+    assert.ok(firstVerify < lastReview, `verify should interleave with reviews, got: ${starts.join(", ")}`)
+    assert.ok(firstVerify <= 4, `first verify should start within the first few slots, got index ${firstVerify}: ${starts.join(", ")}`)
+    assert.deepEqual(JSON.parse(r.result!), ["a", "b", "c", "d", "e", "f"].map((f) => `ok verify ${f}`))
+    console.log(`  ok: start order = ${starts.map((t) => t.replace("review ", "r:").replace("verify ", "v:")).join(" ")}`)
+  }
+
 console.log(`\nALL TESTS PASSED (${Date.now() - t0}ms total, tmp=${tmp})`)
 }
 

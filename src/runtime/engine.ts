@@ -5,6 +5,7 @@
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync, existsSync, rmSync } from "node:fs"
 import { createHash, randomBytes } from "node:crypto"
 import { cpus, hostname } from "node:os"
+import { AsyncLocalStorage } from "node:async_hooks"
 import { join } from "node:path"
 import {
   type AgentState,
@@ -64,6 +65,8 @@ export interface EngineDeps {
   runArgs?: any
   /** called when a child session is created for an agent (agentId, sessionId) */
   onChildSession?: (agentId: string, sessionId: string) => void
+  /** max agents running at once; defaults to min(16, cpus - 2) */
+  concurrency?: number
   log?: (level: "debug" | "info" | "warn" | "error", message: string, meta?: Record<string, unknown>) => void
 }
 
@@ -215,7 +218,15 @@ export class RunEngine {
   private lastTextPart = new Map<string, string>()
   private sem = 0
   private semMax: number
-  private waiters: Array<() => void> = []
+  /**
+   * Agents waiting for a slot. A later pipeline stage outranks an earlier one
+   * (see pipeline()), so an item's verify step does not queue behind every
+   * still-pending review step; equal priority is FIFO.
+   */
+  private waiters: Array<{ priority: number; seq: number; resolve: () => void }> = []
+  private waiterSeq = 0
+  /** pipeline stage depth of the code currently running (0 outside any pipeline) */
+  private stageDepth = new AsyncLocalStorage<number>()
   /** agents the user stopped individually (X): abort, then hand null to the script */
   private stoppedAgents = new Set<string>()
   /** agents the user paused individually (P): abort, keep the session, wait for a decision */
@@ -236,7 +247,8 @@ export class RunEngine {
   constructor(deps: EngineDeps, runId: string) {
     this.deps = deps
     this.runId = runId
-    this.semMax = Math.max(1, Math.min(16, (cpus()?.length ?? 4) - 2))
+    this.semMax =
+      deps.concurrency && deps.concurrency > 0 ? Math.floor(deps.concurrency) : Math.max(1, Math.min(16, (cpus()?.length ?? 4) - 2))
     this.startedAt = Date.now()
     this.resolveModelLabel = (m) => `${m.providerID}/${m.modelID}`
   }
@@ -582,7 +594,13 @@ export class RunEngine {
       items.map(async (item, index) => {
         let prev: any = null
         try {
-          for (const stage of stages) prev = await stage(prev, item, index)
+          // each stage runs one level deeper than the code that called pipeline(),
+          // so agents it spawns take priority over agents of earlier stages
+          const base = this.stageDepth.getStore() ?? 0
+          for (let si = 0; si < stages.length; si++) {
+            const stage = stages[si]
+            prev = await this.stageDepth.run(base + si, () => stage(prev, item, index))
+          }
         } catch (e) {
           this.logLine("log", `pipeline item ${index} dropped: ${errText(e)}`)
           return null
@@ -607,6 +625,7 @@ export class RunEngine {
     if (this.currentPhase === "" && !opts.phase) this.currentPhase = phaseTitle
 
     const model = this.resolveModel(opts.model)
+    const agentType = this.resolveAgentType(opts, label)
     const agent: AgentState = {
       id,
       label,
@@ -657,7 +676,7 @@ export class RunEngine {
     // still has a session → continue there instead of starting over
     const prior = this.takeContinuation(phaseTitle, label, agent.prompt)
 
-    await this.acquireSem()
+    await this.acquireSem(this.stageDepth.getStore() ?? 0)
     try {
       if (this.stopRequested) return this.cancel(agent, "run stopped")
       await this.waitIfPaused()
@@ -739,8 +758,12 @@ export class RunEngine {
         agent.attempts = (agent.attempts ?? 0) + 1
         const body: any = {
           parts: [{ type: "text", text: this.subagentPrompt(prompt, phaseTitle, opts, followUp) }],
+          // a sub-agent never starts a workflow of its own: the run would nest
+          // and escape the concurrency cap, the budget and the /workflows view
+          tools: { workflow: false },
         }
         if (model) body.model = { providerID: model.providerID, modelID: model.modelID }
+        if (agentType) body.agent = agentType
         const res = unwrap(await this.deps.client.session.prompt({ path: { id: sessionId }, body }))
         const info = res?.info
         if (!info) throw new Error("empty session response")
@@ -872,7 +895,7 @@ export class RunEngine {
       }
       this.decisions.delete(agent.id)
     } finally {
-      await this.acquireSem()
+      await this.acquireSem(Infinity)
     }
     this.pausedAgents.delete(agent.id)
     agent.held = false
@@ -935,6 +958,20 @@ export class RunEngine {
     if (hits.length >= 1) return this.parseModel(hits[0])!
     this.logLine("log", `model "${requested}" not found; using session model for agent`)
     return this.parseModel(this.deps.defaultModel)
+  }
+
+  /**
+   * `opts.agentType` names an opencode agent (built-in "general" / "explore" or
+   * one from the agent config) whose prompt, tools and permissions the
+   * sub-agent runs with. Options this engine cannot honour are reported once
+   * per agent instead of being dropped silently.
+   */
+  private resolveAgentType(opts: AgentOpts, label: string): string | undefined {
+    for (const k of ["effort", "isolation"] as const) {
+      if (opts[k] !== undefined) this.logLine("log", `${label}: option "${k}" is not supported by this engine and was ignored`)
+    }
+    const t = typeof opts.agentType === "string" ? opts.agentType.trim() : ""
+    return t || undefined
   }
 
   private parseModel(s?: string): ModelRef | undefined {
@@ -1114,20 +1151,26 @@ export class RunEngine {
 
   // --- concurrency pool --------------------------------------------------------
 
-  private acquireSem(): Promise<void> {
+  private acquireSem(priority = 0): Promise<void> {
     if (this.sem < this.semMax) {
       this.sem++
       return Promise.resolve()
     }
-    return new Promise((res) => this.waiters.push(res))
+    return new Promise((resolve) => this.waiters.push({ priority, seq: this.waiterSeq++, resolve }))
   }
   private releaseSem(): void {
     this.sem--
-    const next = this.waiters.shift()
-    if (next) {
-      this.sem++
-      next()
+    if (!this.waiters.length) return
+    // highest priority first, FIFO within a priority
+    let best = 0
+    for (let i = 1; i < this.waiters.length; i++) {
+      const w = this.waiters[i]
+      const b = this.waiters[best]
+      if (w.priority > b.priority || (w.priority === b.priority && w.seq < b.seq)) best = i
     }
+    const [next] = this.waiters.splice(best, 1)
+    this.sem++
+    next.resolve()
   }
 
   private outputTokensSpent(): number {
