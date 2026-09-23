@@ -1,6 +1,6 @@
 {
   "name": "opencode-ultracode",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Workflow orchestration for opencode: model-authored scripts, parallel sub-agent fleet, live TUI progress view",
   "type": "module",
   "license": "MIT",
